@@ -1,0 +1,8 @@
+# Local release artifacts
+/releases/*.zip
+
+# Runtime and diagnostic output
+*.log
+
+# Local temporary work
+/.TempScripts/
