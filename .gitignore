@@ -6,3 +6,7 @@
 
 # Local temporary work
 /.TempScripts/
+
+# Local verification documents and tests
+/docs/
+/tests/

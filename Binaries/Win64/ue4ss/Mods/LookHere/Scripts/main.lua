@@ -2,8 +2,9 @@ local UEHelpers = require("UEHelpers")
 local Config = require("config")
 
 local MOD_NAME = "LookHere"
-local MOD_VERSION = "1.0.1"
+local MOD_VERSION = "1.1.0"
 local ACTOR_CLASS = "/Script/Engine.Actor"
+local ACTOR_COMPONENT_CLASS = "/Script/Engine.ActorComponent"
 local STATIC_MESH_ACTOR_CLASS = "/Script/Engine.StaticMeshActor"
 local STATIC_MESH_COMPONENT_CLASS = "/Script/Engine.StaticMeshComponent"
 local TEXT_RENDER_COMPONENT_CLASS = "/Script/Engine.TextRenderComponent"
@@ -27,6 +28,12 @@ local PLAYER_CONTROLLER_TICK_PATH = "/Game/Blueprints/Meta/Abiotic_PlayerControl
 local HUD_DRAW_PATH = "/Script/Engine.HUD:ReceiveDrawHUD"
 local HUD_FONT_ASSET = "/Engine/EngineFonts/Roboto"
 local HUD_FONT_PATH = "/Engine/EngineFonts/Roboto.Roboto"
+local DEFAULT_TEXT_INPUT_WIDGET_CLASSES = {
+    "EditableText",
+    "EditableTextBox",
+    "MultiLineEditableText",
+    "MultiLineEditableTextBox",
+}
 
 local GetKismetMathLibrary = UEHelpers.GetKismetMathLibrary
 local GetKismetSystemLibrary = UEHelpers.GetKismetSystemLibrary
@@ -35,6 +42,17 @@ local RawGetPlayerController = UEHelpers.GetPlayerController
 local GetPlayerController = nil
 
 local state = {
+    session = 0,
+    requestInFlight = nil,
+    inputCooldownRemaining = 0.0,
+    cooldownWarningQueued = false,
+    cooldownWarningShown = false,
+    packetSends = {},
+    anchorLifetimes = {},
+    assetCache = {},
+    maintenanceAccumulator = 0.0,
+    diagnostics = { raw = 0, gated = 0, cooldown = 0, entered = 0, sent = 0,
+        batches = 0, broadcasts = 0, idle = 0, maintenance = 0, formalRejected = 0 },
     lastClientRequestTime = -1000.0,
     lastClientRequestWorldKey = nil,
     serverRequestTimes = {},
@@ -47,6 +65,7 @@ local state = {
     markerWidgets = {},
     markerWidgetSlots = {},
     directEntityOutlines = {},
+    outlineStructureDiagnosedTargets = {},
     serverMarkerSlots = {},
     nextServerMarkerSlot = 1,
     widgetUpdateStarted = false,
@@ -78,6 +97,7 @@ local state = {
     localPlayerController = nil,
     localPlayerPawn = nil,
     localPlayerContextLogKey = nil,
+    lastPerformanceLogClock = -1000.0,
 }
 
 local function Log(message)
@@ -145,6 +165,28 @@ local function ObjectKey(object)
     end
 
     return tostring(object)
+end
+
+-- A reflected UObject may arrive in a fresh Lua userdata on each access.
+-- Never use Lua wrapper equality to decide whether the native object changed.
+local function ObjectAddress(object)
+    if not IsObjectValid(object) then return nil end
+    local ok, address = pcall(function() return object:GetAddress() end)
+    if ok and type(address) == "number" and address ~= 0 then return address end
+    return nil
+end
+
+local function SameObject(left, right)
+    local address = ObjectAddress(left)
+    return address ~= nil and address == ObjectAddress(right)
+end
+
+local function ObjectIdentity(object)
+    local address = ObjectAddress(object)
+    if not address then return nil end
+    local ok, name = pcall(function() return object:GetFullName() end)
+    if not ok or type(name) ~= "string" or name == "" then return nil end
+    return string.format("%X|%s", address, name)
 end
 
 local function GetControllerPawn(controller)
@@ -306,6 +348,9 @@ GetPlayerController = function()
 end
 
 local function Now(worldContext)
+    if state.tickNow ~= nil then
+        return state.tickNow
+    end
     local gameplayStatics = GetGameplayStatics()
     if IsObjectValid(gameplayStatics) and IsObjectValid(worldContext) then
         local ok, value = pcall(function()
@@ -316,7 +361,7 @@ local function Now(worldContext)
         end
     end
 
-    return os.clock()
+    return os.time()
 end
 
 local function GetCurrentWorldKey(worldContext)
@@ -337,10 +382,33 @@ local function GetCurrentWorldKey(worldContext)
 end
 
 local function ResetLocalCooldownState(reason)
+    state.session = state.session + 1
+    state.requestInFlight = nil
+    state.inputCooldownRemaining = 0.0
+    state.cooldownWarningQueued = false
+    state.cooldownWarningShown = false
+    state.packetSends = {}
+    state.packetReceivers = {}
+    state.packetCarrierCache = {}
+    state.assetCache = {}
+    state.tickClock = nil
     state.lastClientRequestTime = -1000.0
     state.lastClientRequestWorldKey = nil
     state.lastCooldownWarningTime = -1000.0
     Debug("Local cooldown state reset: " .. tostring(reason or "Unknown"))
+end
+
+-- Asset references are held once per session; an invalid reference is refreshed.
+function state.GetAsset(path)
+    local asset = state.assetCache[path]
+    if IsObjectValid(asset) then return asset end
+    asset = StaticFindObject(path)
+    if not IsObjectValid(asset) then
+        pcall(function() LoadAsset(path) end)
+        asset = StaticFindObject(path)
+    end
+    if IsObjectValid(asset) then state.assetCache[path] = asset end
+    return asset
 end
 
 local function HasAuthority(actor)
@@ -586,6 +654,15 @@ local function GetLocalCrosshairRay(preferredPlayerController)
 end
 
 local function GetServerViewRay(character)
+    -- Only the listen host's own Pawn may use the local camera. Remote senders
+    -- retain their authoritative replicated view and never borrow the host ray.
+    local localController = nil
+    pcall(function() localController = character:GetController() end)
+    if IsStrictlyLocalController(localController)
+        and SameObject(GetControllerPawn(localController), character) then
+        local location, direction = GetLocalCrosshairRay(localController)
+        if location and direction then return location, direction, "LocalCrosshair" end
+    end
     local eyeLocation = {}
     local eyeRotation = {}
     local eyesOk = pcall(function()
@@ -593,7 +670,7 @@ local function GetServerViewRay(character)
     end)
 
     if eyesOk and eyeLocation.X ~= nil and eyeRotation.Yaw ~= nil then
-        return eyeLocation, GetKismetMathLibrary():GetForwardVector(eyeRotation)
+        return eyeLocation, GetKismetMathLibrary():GetForwardVector(eyeRotation), "ActorEyes"
     end
 
     local location = nil
@@ -628,7 +705,7 @@ local function GetServerViewRay(character)
     end
 
     if location and location.X ~= nil and rotation and rotation.Yaw ~= nil then
-        return location, GetKismetMathLibrary():GetForwardVector(rotation)
+        return location, GetKismetMathLibrary():GetForwardVector(rotation), "PawnViewFallback"
     end
 
     return nil
@@ -854,6 +931,17 @@ local function TraceOnce(startLocation, direction, worldContext, actorsToIgnore)
         exactHit = objectHit or channelHit
     end
 
+    local function SelectHit(hit, reason)
+        if Config.TraceSelectionDiagnostics == true then
+            Log(string.format("Trace selection: reason=%s exact=%s probe=%s selected=%s source=%s distance=%.1f",
+                reason, tostring(ObjectKey(exactHit and exactHit.Actor)),
+                tostring(ObjectKey(interactionHit and interactionHit.Actor)),
+                tostring(ObjectKey(hit and hit.Actor)), tostring(hit and hit.Source or "None"),
+                math.sqrt(hit and hit.DistanceSquared or 0)))
+        end
+        return hit
+    end
+
     -- A parent mesh can sit slightly in front of its own interaction button.
     -- Promote the button only when both hits belong to the same Actor and the
     -- button is within a small behind-surface tolerance. This cannot select a
@@ -871,26 +959,26 @@ local function TraceOnce(startLocation, direction, worldContext, actorsToIgnore)
                 or Config.InteractionProbeBehindTolerance
                 or 60.0
             if sameActor and componentDistance <= exactDistance + promotionTolerance then
-                Debug(string.format(
+                if Config.DebugLogging then Debug(string.format(
                     "Promoted interaction component hit: parent_distance=%.1f component_distance=%.1f actor=%s component=%s",
                     exactDistance,
                     componentDistance,
                     tostring(ObjectKey(exactHit.Actor)),
                     tostring(ObjectKey(bestInteractionComponentHit.Component))
-                ))
+                )) end
                 exactHit = bestInteractionComponentHit
             end
         end
     end
 
-    Debug(string.format(
+    if Config.DebugLogging then Debug(string.format(
         "Trace arbitration: exact_actor=%s exact_component=%s sphere_actor=%s sphere_component=%s sphere_eligible=%s",
         tostring(ObjectKey(exactHit and exactHit.Actor or nil)),
         tostring(ObjectKey(exactHit and exactHit.Component or nil)),
         tostring(ObjectKey(interactionHit and interactionHit.Actor or nil)),
         tostring(ObjectKey(interactionHit and interactionHit.Component or nil)),
         tostring(interactionHitEligible)
-    ))
+    )) end
 
     if interactionHit
         and interactionHitEligible
@@ -898,13 +986,18 @@ local function TraceOnce(startLocation, direction, worldContext, actorsToIgnore)
         and IsEntityTarget(interactionHit.Actor)
     then
         if not exactHit then
-            return interactionHit
+            return SelectHit(interactionHit, "probe_without_exact_hit")
         end
 
         local exactIsEntity = IsActorObject(exactHit.Actor) and IsEntityTarget(exactHit.Actor)
         local sameActor = IsActorObject(interactionHit.Actor)
             and IsActorObject(exactHit.Actor)
             and ObjectKey(interactionHit.Actor) == ObjectKey(exactHit.Actor)
+        -- A widened probe can touch nearby furniture before a thin ray reaches
+        -- its intended small entity. Exact entity hits win across different Actors.
+        if exactIsEntity and not sameActor then
+            return SelectHit(exactHit, "exact_entity_before_unrelated_probe")
+        end
         local exactIsInteractionComponent = IsObjectValid(exactHit.Component)
             and type(DoesImplementInteractable) == "function"
             and DoesImplementInteractable(exactHit.Component)
@@ -919,7 +1012,7 @@ local function TraceOnce(startLocation, direction, worldContext, actorsToIgnore)
             and not interactionIsInteractionComponent
         if not preservePreciseComponent and (exactIsEntity or interactionDistance <= exactDistance + tolerance) then
             if not exactIsEntity or interactionHit.DistanceSquared < exactHit.DistanceSquared then
-                return interactionHit
+                return SelectHit(interactionHit, "eligible_probe")
             end
         end
     end
@@ -931,7 +1024,7 @@ local function TraceOnce(startLocation, direction, worldContext, actorsToIgnore)
             tostring(ObjectKey(interactionHit.Component))
         ))
     end
-    return exactHit or (interactionHitEligible and interactionHit or nil)
+    return SelectHit(exactHit or (interactionHitEligible and interactionHit or nil), "nearest_exact_or_probe_fallback")
 end
 
 local function IsOwnedByRequestingPlayer(candidate, requestingPlayer)
@@ -1058,21 +1151,21 @@ local function IsStandaloneTransparentHelperHit(hit)
     if not hit or not IsActorObject(hit.Actor) then
         return false
     end
+    if Config.IgnoreBuildZones ~= false
+        and MatchesConfiguredClassPattern(hit.Actor, { "BuildZone" }) then
+        return true
+    end
     if not MatchesConfiguredClassPattern(hit.Actor, Config.TransparentStandaloneHelperClassPatterns) then
         return false
     end
 
-    -- A generated helper owned/attached by furniture is meaningful: keep the
-    -- hit so ResolveWholeActorHelperParent can promote it exactly one level.
+    -- Legacy behavior remains available when IgnoreBuildZones is disabled.
     local parentActor = GetDirectParentActor(hit.Actor)
     if IsActorObject(parentActor) and ObjectKey(parentActor) ~= ObjectKey(hit.Actor) then
         return false
     end
 
-    -- Standalone BuildZone helpers are gameplay/query volumes, not marker
-    -- targets. Ignore the whole keyword-matched Actor regardless of whether a
-    -- debug hologram happens to be visible; parented variants were preserved
-    -- above so furniture can still be promoted normally.
+    -- Standalone keyword-matched helpers remain transparent in legacy mode.
     return true
 end
 
@@ -1302,11 +1395,6 @@ local function AppendObjectCollection(result, seen, collection)
     end)
 end
 
-local function GetShortRuntimeClassName(object)
-    local className = GetObjectClassName(object, "")
-    return className:match("([%w_]+_C)$") or className:match("([%w_]+)$") or ""
-end
-
 local function BelongsToActor(object, parentActor)
     if not IsObjectValid(object) or not IsActorObject(parentActor) then
         return false
@@ -1340,23 +1428,9 @@ local function GetInteractableChildren(parentActor, hitChild)
     pcall(function() parentActor:GetAllChildActors(childActors, false) end)
     AppendObjectCollection(result, seen, childActors)
 
-    -- If returned TArrays were not bridged back into Lua, scan the exact hit
-    -- class and retain only objects owned by the same outer Actor.
-    if IsObjectValid(hitChild) then
-        local className = GetShortRuntimeClassName(hitChild)
-        if className ~= "" then
-            local candidates = nil
-            pcall(function() candidates = FindAllOf(className) end)
-            if type(candidates) == "table" then
-                for _, candidate in ipairs(candidates) do
-                    if BelongsToActor(candidate, parentActor) then
-                        AddUniqueObject(result, seen, candidate)
-                    end
-                end
-            end
-        end
-    end
-
+    -- Keep discovery scoped to this Actor. Earlier builds used FindAllOf on
+    -- the hit component class as a bridge fallback, which could walk every
+    -- matching object in the level and hitch the game on a single marker.
     AddUniqueObject(result, seen, hitChild)
     local interactable = {}
     for _, child in ipairs(result) do
@@ -1502,13 +1576,7 @@ local function SetSphereComponentProperties(component)
         return false
     end
 
-    local sphereMesh = StaticFindObject(SPHERE_MESH_PATH)
-    if not IsObjectValid(sphereMesh) then
-        pcall(function()
-            LoadAsset(SPHERE_MESH_PATH)
-        end)
-        sphereMesh = StaticFindObject(SPHERE_MESH_PATH)
-    end
+    local sphereMesh = state.GetAsset(SPHERE_MESH_PATH)
 
     if IsObjectValid(sphereMesh) then
         pcall(function() component:SetStaticMesh(sphereMesh) end)
@@ -1624,32 +1692,24 @@ local function GetObjectWorldLocation(object)
     return location and location.X ~= nil and location or nil
 end
 
-local function ResolvePreciseComponentTarget(anchor, parentActor)
+local function ResolvePreciseComponentTarget(anchor, parentActor, rayComponent)
     if not IsPreciseComponentAnchor(anchor) or not IsActorObject(parentActor) then
         return nil
     end
 
+    if IsObjectValid(rayComponent)
+        and BelongsToActor(rayComponent, parentActor)
+        and DoesImplementInteractable(rayComponent)
+    then
+        Debug(string.format(
+            "Precise component resolved directly from local ray: parent=%s selected=%s",
+            tostring(ObjectKey(parentActor)),
+            tostring(ObjectKey(rayComponent))
+        ))
+        return rayComponent
+    end
+
     local candidates = GetInteractableChildren(parentActor, nil)
-    local seen = {}
-    for _, candidate in ipairs(candidates) do
-        local key = ObjectKey(candidate)
-        if key then
-            seen[key] = true
-        end
-    end
-    for _, className in ipairs(Config.PreciseInteractionComponentClasses or { "VendingButton_BP_C" }) do
-        local classObjects = nil
-        pcall(function() classObjects = FindAllOf(className) end)
-        if type(classObjects) == "table" then
-            for _, candidate in ipairs(classObjects) do
-                local key = ObjectKey(candidate)
-                if key and not seen[key] and BelongsToActor(candidate, parentActor) and DoesImplementInteractable(candidate) then
-                    seen[key] = true
-                    table.insert(candidates, candidate)
-                end
-            end
-        end
-    end
 
     local anchorLocation = GetObjectWorldLocation(anchor)
     local selected = nil
@@ -1698,137 +1758,200 @@ local function PointToActorBoundsDistanceSquared(point, actor)
     return dx * dx + dy * dy + dz * dz
 end
 
-local function ResolveEntityTargetLocally(anchor)
+local function NormalizeVectorBetween(from, to)
+    if not from or not to then
+        return nil
+    end
+    local dx = (to.X or 0.0) - (from.X or 0.0)
+    local dy = (to.Y or 0.0) - (from.Y or 0.0)
+    local dz = (to.Z or 0.0) - (from.Z or 0.0)
+    local length = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if length < 0.001 then
+        return nil
+    end
+    return MakeVector(dx / length, dy / length, dz / length)
+end
+
+local function BuildLocalResolveRay(anchorLocation, requestingCharacter)
+    local viewLocation = nil
+    if IsActorObject(requestingCharacter) then
+        pcall(function()
+            viewLocation = select(1, GetServerViewRay(requestingCharacter))
+        end)
+    end
+    if not viewLocation or viewLocation.X == nil then
+        viewLocation = GetObjectWorldLocation(requestingCharacter)
+        if viewLocation and viewLocation.X ~= nil then
+            viewLocation = MakeVector(viewLocation.X, viewLocation.Y, viewLocation.Z + 60.0)
+        end
+    end
+
+    local direction = NormalizeVectorBetween(viewLocation, anchorLocation)
+    if not direction then
+        return nil
+    end
+    return AddScaledVector(anchorLocation, direction, -(Config.LocalResolveRayBacktrack or 120.0)),
+        AddScaledVector(anchorLocation, direction, Config.LocalResolveRayForward or 80.0)
+end
+
+local function ResolveEntityRayCandidate(hit, anchorLocation, expectedClassSignature, requestingCharacter)
+    if not hit or not IsActorObject(hit.Actor) then
+        return nil
+    end
+    if IsStandaloneTransparentHelperHit(hit) then return nil end
+    if IsOwnedByRequestingPlayer(hit.Actor, requestingCharacter) then
+        return nil
+    end
+
+    local candidate = ResolveWholeActorHelperParent(hit.Actor)
+    if not IsActorObject(candidate) or not IsEntityTarget(candidate) then
+        return nil
+    end
+
+    local candidateSignature = GetMarkerClassSignature(candidate)
+    if expectedClassSignature > 0 and candidateSignature ~= expectedClassSignature then
+        return nil
+    end
+    if not ActorHasVisibleMesh(candidate) then
+        return nil
+    end
+
+    local boundsDistance = PointToActorBoundsDistanceSquared(anchorLocation, candidate)
+    local maximumDistance = Config.LocalResolveMaxBoundsDistance or 80.0
+    if boundsDistance > maximumDistance * maximumDistance then
+        return nil
+    end
+    return {
+        Actor = candidate,
+        Component = hit.Component,
+        Source = hit.Source,
+        BoundsDistance = boundsDistance,
+        Signature = candidateSignature,
+    }
+end
+
+local function ResolveEntityTargetLocally(anchor, requestingCharacter)
     if not IsEntityAnchor(anchor) then
         return nil
     end
 
     local anchorLocation = GetObjectWorldLocation(anchor)
     local systemLibrary = GetKismetSystemLibrary()
-    local actorClass = StaticFindObject(ACTOR_CLASS)
-    if not anchorLocation or not IsObjectValid(systemLibrary) or not IsObjectValid(actorClass) then
-        Log("Local entity resolver unavailable: missing anchor location, system library or Actor class")
+    local rayStart, rayEnd = BuildLocalResolveRay(anchorLocation, requestingCharacter)
+    if not anchorLocation or not IsObjectValid(systemLibrary) or not rayStart or not rayEnd then
+        Log("Local entity resolver unavailable: missing anchor, sender view or system library")
         return nil
     end
 
-    local objectTypes = {}
-    local objectTypeCount = math.max(1, math.floor(Config.LocalResolveObjectTypeCount or 32))
-    for objectType = 0, objectTypeCount - 1 do
-        table.insert(objectTypes, objectType)
-    end
-
-    local ignoredActors = { anchor }
-    local overlapOutput = {}
-    local overlapOk, overlapped = pcall(function()
-        return systemLibrary:SphereOverlapActors(
-            anchor,
-            anchorLocation,
-            Config.LocalResolveRadius or 180.0,
-            objectTypes,
-            actorClass,
-            ignoredActors,
-            overlapOutput
-        )
-    end)
-
-    local rawCandidates = {}
-    local rawSeen = {}
-    if overlapOk and overlapped then
-        AppendObjectCollection(rawCandidates, rawSeen, overlapOutput)
-    end
-
-    local scored = {}
     local expectedClassSignature = DecodeMarkerClassSignature(anchor)
-    local matchingClassCount = 0
+    local ignoredActors = { anchor }
+    if IsActorObject(requestingCharacter) then
+        table.insert(ignoredActors, requestingCharacter)
+    end
+    if IsActorObject(state.localPlayerPawn)
+        and ObjectKey(state.localPlayerPawn) ~= ObjectKey(requestingCharacter)
+    then
+        table.insert(ignoredActors, state.localPlayerPawn)
+    end
+
+    local transparent = { R = 0, G = 0, B = 0, A = 0 }
+    local queries = {}
+    for _, traceComplex in ipairs({ false, true }) do
+        table.insert(queries, {
+            Kind = "objects",
+            Value = Config.LocalResolveObjectTypes or Config.ObjectTraceTypes or { 0, 1, 2, 3, 4, 5 },
+            Complex = traceComplex,
+            Source = traceComplex and "ResolveObjectsComplex" or "ResolveObjectsSimple",
+        })
+    end
+    for _, traceChannel in ipairs(Config.LocalResolveTraceChannels or { 0, 2 }) do
+        table.insert(queries, {
+            Kind = "channel",
+            Value = traceChannel,
+            Complex = false,
+            Source = "ResolveChannel" .. tostring(traceChannel),
+        })
+    end
+
+    local startedAt = os.clock()
+    local queryCount = 0
+    local rawHitCount = 0
     local selected = nil
-    local selectedScore = math.huge
-    local selectedBoundsDistance = math.huge
-    local candidateSeen = {}
-    for _, rawCandidate in ipairs(rawCandidates) do
-        local candidate = ResolveActorFromObject(rawCandidate)
-        if IsActorObject(candidate) then
-            candidate = ResolveWholeActorHelperParent(candidate)
-        end
-        local candidateKey = ObjectKey(candidate)
-        if candidateKey
-            and candidateKey ~= ObjectKey(anchor)
-            and not candidateSeen[candidateKey]
-            and IsEntityTarget(candidate)
-            and ActorHasVisibleMesh(candidate)
-        then
-            candidateSeen[candidateKey] = true
-            local boundsDistance = PointToActorBoundsDistanceSquared(anchorLocation, candidate)
-            local actorLocation = GetObjectWorldLocation(candidate)
-            local originDistance = actorLocation
-                and TraceDistanceSquared(anchorLocation, actorLocation)
-                or math.huge
-            local candidateClassSignature = GetMarkerClassSignature(candidate)
-            local classMatches = expectedClassSignature > 0
-                and candidateClassSignature == expectedClassSignature
-            if classMatches then
-                matchingClassCount = matchingClassCount + 1
+    for _, query in ipairs(queries) do
+        queryCount = queryCount + 1
+        local hitResult = {}
+        local ok, wasHit = pcall(function()
+            if query.Kind == "objects" then
+                return systemLibrary:LineTraceSingleForObjects(
+                    anchor, rayStart, rayEnd, query.Value, query.Complex,
+                    ignoredActors, 0, hitResult, true, transparent, transparent, 0.0
+                )
             end
-            -- Bounds distance identifies the surface under the replicated hit
-            -- point. Actor-origin distance breaks ties when multiple large
-            -- local collision volumes overlap the same point.
-            local score = boundsDistance * 1000.0 + math.min(originDistance, 1.0e12)
-            if expectedClassSignature > 0 and not classMatches then
-                score = score + 1.0e18
-            end
-            table.insert(scored, {
-                Actor = candidate,
-                Key = candidateKey,
-                Score = score,
-                BoundsDistance = boundsDistance,
-                OriginDistance = originDistance,
-                ClassSignature = candidateClassSignature,
-                ClassMatches = classMatches,
-            })
-            if score < selectedScore then
-                selected = candidate
-                selectedScore = score
-                selectedBoundsDistance = boundsDistance
+            return systemLibrary:LineTraceSingle(
+                anchor, rayStart, rayEnd, query.Value, query.Complex,
+                ignoredActors, 0, hitResult, true, transparent, transparent, 0.0
+            )
+        end)
+        if ok and wasHit then
+            rawHitCount = rawHitCount + 1
+            local hit = BuildTraceHit(hitResult, rayStart, query.Source)
+            selected = ResolveEntityRayCandidate(
+                hit, anchorLocation, expectedClassSignature, requestingCharacter
+            )
+            if selected then
+                break
             end
         end
     end
 
-    table.sort(scored, function(left, right) return left.Score < right.Score end)
-    local preview = {}
-    local previewCount = math.min(#scored, math.max(1, math.floor(Config.LocalResolveLogCandidateCount or 8)))
-    for index = 1, previewCount do
-        local record = scored[index]
-        table.insert(preview, string.format(
-            "%d:%s[class=%d,match=%s,bounds=%.1f,origin=%.1f]",
-            index,
-            GetObjectName(record.Actor, "Unknown"),
-            record.ClassSignature,
-            tostring(record.ClassMatches),
-            math.sqrt(record.BoundsDistance),
-            math.sqrt(record.OriginDistance)
-        ))
+    -- The replicated anchor is offset slightly away from the original surface.
+    -- If exact lines miss a thin target, use one narrow swept ray around the
+    -- same short segment. This never enumerates Actors in a world-space sphere.
+    if not selected and (Config.LocalResolveRaySweepRadius or 0.0) > 0.0 then
+        queryCount = queryCount + 1
+        local hitResult = {}
+        local ok, wasHit = pcall(function()
+            return systemLibrary:SphereTraceSingleForObjects(
+                anchor,
+                rayStart,
+                rayEnd,
+                Config.LocalResolveRaySweepRadius,
+                Config.LocalResolveObjectTypes or Config.ObjectTraceTypes or { 0, 1, 2, 3, 4, 5 },
+                false,
+                ignoredActors,
+                0,
+                hitResult,
+                true,
+                transparent,
+                transparent,
+                0.0
+            )
+        end)
+        if ok and wasHit then
+            rawHitCount = rawHitCount + 1
+            local hit = BuildTraceHit(hitResult, rayStart, "ResolveNarrowSweep")
+            selected = ResolveEntityRayCandidate(
+                hit, anchorLocation, expectedClassSignature, requestingCharacter
+            )
+        end
     end
 
-    local maximumDistance = Config.LocalResolveMaxBoundsDistance or 80.0
-    if selectedBoundsDistance > maximumDistance * maximumDistance then
-        selected = nil
-    end
+    local elapsedMs = (os.clock() - startedAt) * 1000.0
     Log(string.format(
-        "Local entity resolver: overlap_ok=%s overlapped=%s raw=%d eligible=%d expected_class=%d matching_class=%d radius=%.1f selected=%s bounds_distance=%.1f candidates=%s",
-        tostring(overlapOk),
-        tostring(overlapped),
-        #rawCandidates,
-        #scored,
+        "Local entity ray resolver: queries=%d raw_hits=%d expected_class=%d selected=%s component=%s source=%s bounds_distance=%.1f elapsed_ms=%.3f",
+        queryCount,
+        rawHitCount,
         expectedClassSignature,
-        matchingClassCount,
-        Config.LocalResolveRadius or 180.0,
-        tostring(ObjectKey(selected) or "None"),
-        math.sqrt(selectedBoundsDistance),
-        table.concat(preview, ";")
+        tostring(selected and ObjectKey(selected.Actor) or "None"),
+        tostring(selected and ObjectKey(selected.Component) or "None"),
+        tostring(selected and selected.Source or "None"),
+        math.sqrt(selected and selected.BoundsDistance or math.huge),
+        elapsedMs
     ))
-    return selected
+    return selected and selected.Actor or nil, selected and selected.Component or nil
 end
 
-local function ResolveEntityTarget(anchor)
+local function ResolveEntityTarget(anchor, requestingCharacter)
     if not IsEntityAnchor(anchor) then
         return nil
     end
@@ -1837,13 +1960,13 @@ local function ResolveEntityTarget(anchor)
     local debugInfo = anchorKey and state.markerDebugInfo[anchorKey] or nil
     if debugInfo and IsObjectValid(debugInfo.EntityTarget) then
         Debug("Entity target resolved from authoritative server marker state")
-        return debugInfo.EntityTarget
+        return debugInfo.EntityTarget, debugInfo.Component
     end
 
     -- The anchor Owner is deliberately the replicated requesting character,
     -- never the marked target. Map actors and locally constructed interactables
     -- are resolved independently on every client from the marker descriptor.
-    return ResolveEntityTargetLocally(anchor)
+    return ResolveEntityTargetLocally(anchor, requestingCharacter)
 end
 
 local function ResolveMarkerTarget(anchor)
@@ -1996,31 +2119,201 @@ local ProcessPendingMarkerWork = function() end
 local PlayLocalMarkerSuccessSound = function() return false, "not initialized" end
 local ConfigureBroadcastVisualization = function() return false end
 
-local function HandlePlayerControllerTick(contextParam, deltaSecondsParam)
-    local tickingController = ParamValue(contextParam)
-    local contextOk, localPawn = ValidateLocalPlayerContext(tickingController)
-    if not contextOk then
+local function HasTableEntries(value)
+    return type(value) == "table" and next(value) ~= nil
+end
+
+local function HasMarkerMaintenanceWork()
+    return HasTableEntries(state.packetSends)
+        or HasTableEntries(state.anchorLifetimes)
+        or HasTableEntries(state.packetCarrierCache)
+        or HasTableEntries(state.packetReceivers)
+        or HasTableEntries(state.pendingBroadcasts)
+        or HasTableEntries(state.pendingVisualizations)
+        or HasTableEntries(state.directEntityOutlines)
+        or HasTableEntries(state.activeMarkerTargets)
+        or HasTableEntries(state.markerDebugInfo)
+        or HasTableEntries(state.localSuccessSoundAnchors)
+        or HasTableEntries(state.processedBroadcastAnchors)
+        or HasTableEntries(state.packetLocalSlots)
+end
+
+local function HasMarkerVisualWork()
+    return #state.labelComponents > 0 or HasTableEntries(state.markerWidgets)
+end
+
+local function CountTableEntries(value)
+    local count = 0
+    if type(value) == "table" then
+        for _ in pairs(value) do
+            count = count + 1
+        end
+    end
+    return count
+end
+
+function state.ReportDiagnostics(phase)
+    if Config.InputDiagnostics ~= true then return end
+    local wall = os.time()
+    if wall - (state.lastDiagnosticWall or 0) < (Config.InputDiagnosticsInterval or 5) then return end
+    state.lastDiagnosticWall = wall
+    local d = state.diagnostics
+    local signature = table.concat({ d.raw, d.sent, d.broadcasts, phase }, ":")
+    if signature == state.lastDiagnosticSignature then return end
+    state.lastDiagnosticSignature = signature
+    local counts = {}
+    for _, name in ipairs({ "packetSends", "packetReceivers", "packetCarrierCache",
+        "pendingBroadcasts", "pendingVisualizations", "directEntityOutlines", "activeMarkerTargets",
+        "markerDebugInfo", "localSuccessSoundAnchors", "processedBroadcastAnchors", "packetLocalSlots",
+        "anchorLifetimes", "markerWidgets", "serverMarkerSlots" }) do
+        counts[#counts + 1] = name .. "=" .. CountTableEntries(state[name])
+    end
+    Log(string.format("Input diagnostics: raw=%d gated=%d cooldown=%d formal_rejected=%d entered=%d sent=%d batches=%d broadcasts=%d idle_ticks=%d maintenance_runs=%d phase=%s %s",
+        d.raw, d.gated, d.cooldown, d.formalRejected, d.entered, d.sent, d.batches, d.broadcasts,
+        d.idle, d.maintenance, phase, table.concat(counts, " ")))
+end
+
+local function LogSlowMarkerTick(totalMs, maintenanceMs, legacyLabelMs, widgetMs, preflightMs, sendMs)
+    if Config.PerformanceDiagnostics ~= true
+        or totalMs < (Config.PerformanceSlowTickThresholdMs or 2.0)
+    then
         return
     end
 
-    LogLocalPlayerContext("selected", tickingController, localPawn, "local_controller_tick")
-    state.localPlayerController = tickingController
-    state.localPlayerPawn = localPawn
+    local nowClock = os.time()
+    if nowClock - state.lastPerformanceLogClock
+        < (Config.PerformanceLogThrottleSeconds or 2.0)
+    then
+        return
+    end
+    state.lastPerformanceLogClock = nowClock
+
+    Log(string.format(
+        "Performance slow marker tick: total_ms=%.3f maintenance_ms=%.3f legacy_label_ms=%.3f widget_ms=%.3f preflight_ms=%.3f send_ms=%.3f widgets=%d entity_outlines=%d receivers=%d pending=%d",
+        totalMs,
+        maintenanceMs,
+        legacyLabelMs,
+        widgetMs,
+        preflightMs,
+        sendMs,
+        CountTableEntries(state.markerWidgets),
+        CountTableEntries(state.directEntityOutlines),
+        CountTableEntries(state.packetReceivers),
+        CountTableEntries(state.pendingBroadcasts) + CountTableEntries(state.pendingVisualizations)
+    ))
+end
+
+local function HandlePlayerControllerTick(contextParam, deltaSecondsParam)
+    -- ReceiveTick remains hooked for the lifetime of the Mod, but an idle Mod
+    -- must not cross the Lua/Unreal boundary every frame. All active work adds
+    -- itself to one of the state collections checked here.
+    if not HasMarkerMaintenanceWork() and not HasMarkerVisualWork()
+        and state.inputCooldownRemaining <= 0 and not state.requestInFlight then
+        state.labelUpdateAccumulator = 0.0
+        state.tickClock = nil
+        state.diagnostics.idle = state.diagnostics.idle + 1
+        if state.ReportDiagnostics then state.ReportDiagnostics("idle") end
+        return
+    end
+
+    local tickingController = ParamValue(contextParam)
+    local isCachedLocalController = tickingController ~= nil
+        and SameObject(tickingController, state.localPlayerController)
+    if not isCachedLocalController and not IsStrictlyLocalController(tickingController) then
+        return
+    end
 
     local deltaSeconds = ParamValue(deltaSecondsParam)
     if type(deltaSeconds) ~= "number" or deltaSeconds <= 0.0 then
-        deltaSeconds = 1.0 / 60.0
+        return
     end
 
+    -- Game delta, not CPU time: pause/dilation matches the authoritative cooldown.
+    state.inputCooldownRemaining = math.max(0, state.inputCooldownRemaining - deltaSeconds)
+    if state.tickClock ~= nil then state.tickClock = state.tickClock + deltaSeconds end
     state.labelUpdateAccumulator = state.labelUpdateAccumulator + deltaSeconds
     if state.labelUpdateAccumulator < (Config.LabelUpdateInterval or 0.05) then
         return
     end
 
+    local updateDelta = state.labelUpdateAccumulator
     state.labelUpdateAccumulator = 0.0
-    ProcessPendingMarkerWork()
-    UpdateTrackedLabels()
-    UpdateMarkerWidgets()
+    local tickStartedAt = os.clock()
+    local localPawn = state.localPlayerPawn
+    if not isCachedLocalController or not IsObjectValid(localPawn) then
+        local contextOk, verifiedPawn = ValidateLocalPlayerContext(tickingController)
+        if not contextOk then
+            ResetLocalCooldownState("LocalContextUnavailable")
+            if state.ResetMarkers then state.ResetMarkers(false) end
+            return
+        end
+        local contextChanged = not SameObject(tickingController, state.localPlayerController)
+            or not SameObject(verifiedPawn, state.localPlayerPawn)
+        state.localPlayerController = tickingController
+        state.localPlayerPawn = verifiedPawn
+        localPawn = verifiedPawn
+        if contextChanged then
+            LogLocalPlayerContext("selected", tickingController, verifiedPawn, "active_marker_tick")
+        end
+    end
+
+    -- Inspect the session at low frequency; no world/time query on the 20 Hz path.
+    state.maintenanceAccumulator = state.maintenanceAccumulator + updateDelta
+    local cleanupDue = state.maintenanceAccumulator >= (Config.MaintenanceInterval or 0.5)
+    if cleanupDue or state.tickClock == nil then
+        local worldKey = GetCurrentWorldKey(tickingController)
+        if state.activeWorldKey and state.activeWorldKey ~= worldKey then
+            ResetLocalCooldownState("WorldChanged")
+            if state.ResetMarkers then state.ResetMarkers(false) end
+        end
+        state.activeWorldKey = worldKey
+    end
+    if state.tickClock == nil then state.tickClock = Now(tickingController) end
+    state.tickNow = state.tickClock
+    local preflightMs = (os.clock() - tickStartedAt) * 1000.0
+    local sendMs = 0.0
+    local maintenanceMs = 0.0
+    local legacyLabelMs = 0.0
+    local widgetMs = 0.0
+
+    local tickOk, tickError = pcall(function()
+    if HasTableEntries(state.packetSends) then
+        local phaseStartedAt = os.clock()
+        state.ProcessPacketSends(tickingController)
+        sendMs = (os.clock() - phaseStartedAt) * 1000.0
+    end
+    if HasMarkerMaintenanceWork() then
+        local phaseStartedAt = os.clock()
+        ProcessPendingMarkerWork(cleanupDue)
+        maintenanceMs = (os.clock() - phaseStartedAt) * 1000.0
+    end
+    if #state.labelComponents > 0 then
+        local phaseStartedAt = os.clock()
+        UpdateTrackedLabels()
+        legacyLabelMs = (os.clock() - phaseStartedAt) * 1000.0
+    end
+    if HasTableEntries(state.markerWidgets) then
+        local phaseStartedAt = os.clock()
+        UpdateMarkerWidgets(tickingController)
+        widgetMs = (os.clock() - phaseStartedAt) * 1000.0
+    end
+    end)
+    state.tickNow = nil
+    if cleanupDue then state.maintenanceAccumulator = 0.0 end
+    if not tickOk then
+        if os.time() ~= state.lastTickErrorAt then Log("Marker tick failed: " .. tostring(tickError)) end
+        state.lastTickErrorAt = os.time()
+    end
+    if state.ReportDiagnostics then state.ReportDiagnostics("active") end
+
+    LogSlowMarkerTick(
+        (os.clock() - tickStartedAt) * 1000.0,
+        maintenanceMs,
+        legacyLabelMs,
+        widgetMs,
+        preflightMs,
+        sendMs
+    )
 end
 
 local function GetMarkerPlayerName(character)
@@ -2285,8 +2578,11 @@ local function SetWidgetElementVisibility(element, visibility)
     end
 end
 
-UpdateMarkerWidgets = function()
-    local playerController = GetPlayerController()
+UpdateMarkerWidgets = function(preferredPlayerController)
+    local playerController = preferredPlayerController
+    if not IsObjectValid(playerController) then
+        playerController = GetPlayerController()
+    end
     local widgetLayout = StaticFindObject("/Script/UMG.Default__WidgetLayoutLibrary")
     if not IsObjectValid(playerController) or not IsObjectValid(widgetLayout) then
         return
@@ -2493,8 +2789,8 @@ local function GetHudLabelColor(playerName)
     return HUD_LABEL_PALETTE[(hash % #HUD_LABEL_PALETTE) + 1]
 end
 
-local function GetMarkerDrawLocation(trackingActor, anchor)
-    local actorLocation = GetObjectWorldLocation(trackingActor)
+local function GetMarkerDrawLocation(trackingActor, anchor, knownLocation)
+    local actorLocation = knownLocation or GetObjectWorldLocation(trackingActor)
 
     if not IsActorObject(trackingActor) then
         if actorLocation then
@@ -2516,7 +2812,7 @@ local function GetMarkerDrawLocation(trackingActor, anchor)
         trackingActor:GetActorBounds(false, boundsOrigin, boundsExtent, false)
     end)
     if boundsOk and boundsOrigin.X ~= nil and boundsExtent.Z ~= nil then
-        local isEntityTracking = IsObjectValid(anchor) and trackingActor ~= anchor
+        local isEntityTracking = IsObjectValid(anchor) and not SameObject(trackingActor, anchor)
         if isEntityTracking and actorLocation and actorLocation.X ~= nil then
             local dx = boundsOrigin.X - actorLocation.X
             local dy = boundsOrigin.Y - actorLocation.Y
@@ -2552,7 +2848,7 @@ local function GetMarkerDrawLocation(trackingActor, anchor)
         )
     end
 
-    if actorLocation and IsObjectValid(anchor) and trackingActor ~= anchor then
+    if actorLocation and IsObjectValid(anchor) and not SameObject(trackingActor, anchor) then
         return AddScaledVector(
             actorLocation,
             { X = 0.0, Y = 0.0, Z = 1.0 },
@@ -2560,6 +2856,25 @@ local function GetMarkerDrawLocation(trackingActor, anchor)
         )
     end
     return actorLocation
+end
+
+-- Cache only a short-lived relative bounds offset, never a target hit or world
+-- position. Moving actors continue to follow their current location each update.
+state.GetCachedMarkerDrawLocation = function(entry, now)
+    local location = GetObjectWorldLocation(entry.TrackingActor)
+    if not location then return nil end
+    local cache = entry.DrawOffset
+    if cache and now >= cache.At and now < cache.ExpiresAt then
+        return MakeVector(location.X + cache.X, location.Y + cache.Y, location.Z + cache.Z)
+    end
+    local point = GetMarkerDrawLocation(entry.TrackingActor, entry.Anchor, location)
+    if point then
+        entry.DrawOffset = {
+            X = point.X - location.X, Y = point.Y - location.Y, Z = point.Z - location.Z,
+            At = now, ExpiresAt = now + math.max(0, Config.LabelBoundsUpdateInterval or 0.25),
+        }
+    end
+    return point
 end
 
 local function GetPrimaryHudCanvas()
@@ -2827,6 +3142,8 @@ local function CreateMarkerTextWidget(entry, anchorKey)
     entry.Widget = clone
     entry.Slot = slot
     entry.ParentCanvas = hudCanvas
+    entry.LastLeft, entry.LastTop, entry.LastWidth, entry.LastHeight = nil, nil, nil, nil
+    entry.LastLabel, entry.LastVisibility = entry.Label, 0
     Debug("Primary HUD TextBlock created: " .. entry.Label)
     return true, nil
 end
@@ -2885,6 +3202,7 @@ EnsureMarkerLabel = function(anchor, character, trackingActor)
         state.markerWidgets[anchorKey] = entry
     else
         entry.Anchor = anchor
+        entry.DrawOffset = nil
         entry.TrackingActor = IsObjectValid(trackingActor) and trackingActor or anchor
         entry.Label = BuildMarkerLabel(character, anchor)
         entry.Color = GetHudLabelColor(playerName)
@@ -2907,9 +3225,16 @@ EnsureMarkerLabel = function(anchor, character, trackingActor)
     return created
 end
 
-UpdateMarkerWidgets = function()
-    local playerController = GetPlayerController()
-    local widgetLayout = StaticFindObject("/Script/UMG.Default__WidgetLayoutLibrary")
+UpdateMarkerWidgets = function(preferredPlayerController)
+    local playerController = preferredPlayerController
+    if not IsObjectValid(playerController) then
+        playerController = GetPlayerController()
+    end
+    local widgetLayout = state.markerWidgetLayout
+    if not IsObjectValid(widgetLayout) then
+        widgetLayout = StaticFindObject("/Script/UMG.Default__WidgetLayoutLibrary")
+        state.markerWidgetLayout = widgetLayout
+    end
     if not IsObjectValid(playerController) or not IsObjectValid(widgetLayout) then
         return
     end
@@ -2923,6 +3248,7 @@ UpdateMarkerWidgets = function()
     end)
 
     local now = Now(playerController)
+    local canvasGeometries = {}
     for anchorKey, entry in pairs(state.markerWidgets) do
         local expired = type(entry.ExpiresAt) == "number" and now >= entry.ExpiresAt
         if expired then
@@ -2930,11 +3256,11 @@ UpdateMarkerWidgets = function()
                 "Removed expired marker label: slot=%s",
                 tostring(entry.MarkerIndex or "unknown")
             ))
-            RemoveMarkerWidget(anchorKey)
+            state.CleanupAnchor(anchorKey, "lifetime_expired")
         elseif not IsObjectValid(entry.Anchor) or not IsObjectValid(entry.TrackingActor) then
-            RemoveMarkerWidget(anchorKey)
+            state.CleanupAnchor(anchorKey, "object_invalid")
         elseif IsObjectValid(entry.Widget) and IsObjectValid(entry.Slot) then
-            local worldLocation = GetMarkerDrawLocation(entry.TrackingActor, entry.Anchor)
+            local worldLocation = state.GetCachedMarkerDrawLocation(entry, now)
             local screenPosition = {}
             local projected = false
             if worldLocation then
@@ -2953,12 +3279,16 @@ UpdateMarkerWidgets = function()
                 local height = Config.HudLabelHeight or 64.0
                 local uiX = screenPosition.X / viewportScale
                 local uiY = screenPosition.Y / viewportScale
-                local isEntityTracking = entry.TrackingActor ~= entry.Anchor
+                local isEntityTracking = not SameObject(entry.TrackingActor, entry.Anchor)
 
                 if state.screenToWidgetLocalSupported ~= false and IsObjectValid(entry.ParentCanvas) then
-                    local geometry = nil
-                    pcall(function() geometry = entry.ParentCanvas:GetCachedGeometry() end)
-                    if geometry ~= nil then
+                    local canvasKey = ObjectAddress(entry.ParentCanvas)
+                    local geometry = canvasKey and canvasGeometries[canvasKey] or nil
+                    if geometry == nil then
+                        pcall(function() geometry = entry.ParentCanvas:GetCachedGeometry() end)
+                        if canvasKey then canvasGeometries[canvasKey] = geometry or false end
+                    end
+                    if geometry then
                         local convertOk, actualConvertError = pcall(function()
                             widgetLayout:ScreenToWidgetLocal(
                                 playerController,
@@ -2988,18 +3318,31 @@ UpdateMarkerWidgets = function()
                     and (Config.EntityLabelVerticalAlignment or 0.5)
                     or (Config.WorldLabelVerticalAlignment or 0.5)
                 uiY = uiY - screenOffset
+                local left = uiX - (width * 0.5)
+                local top = uiY - (height * verticalAlignment)
                 moveOk, moveError = pcall(function()
-                    entry.Slot:SetOffsets({
-                        Left = uiX - (width * 0.5),
-                        Top = uiY - (height * verticalAlignment),
-                        Right = width,
-                        Bottom = height,
-                    })
-                    entry.Widget:SetVisibility(0)
-                    entry.Widget:SetText(FText(entry.Label))
+                    if entry.LastLeft ~= left or entry.LastTop ~= top
+                        or entry.LastWidth ~= width or entry.LastHeight ~= height then
+                        entry.Slot:SetOffsets({Left=left, Top=top, Right=width, Bottom=height})
+                        entry.LastLeft, entry.LastTop = left, top
+                        entry.LastWidth, entry.LastHeight = width, height
+                    end
+                    if entry.LastVisibility ~= 0 then
+                        entry.Widget:SetVisibility(0)
+                        entry.LastVisibility = 0
+                    end
+                    if entry.LastLabel ~= entry.Label then
+                        entry.Widget:SetText(FText(entry.Label))
+                        entry.LastLabel = entry.Label
+                    end
                 end)
             else
-                pcall(function() entry.Widget:SetVisibility(2) end)
+                if entry.LastVisibility ~= 2 then
+                    pcall(function()
+                        entry.Widget:SetVisibility(2)
+                        entry.LastVisibility = 2
+                    end)
+                end
             end
 
             if not state.hudDrawDiagnostics[anchorKey] then
@@ -3182,39 +3525,29 @@ local function EnsureOutlineComponent(targetActor)
     return true, outlineComponent
 end
 
-local function CollectPrimitiveComponents(actor)
+local function CollectMeshComponents(actor)
     local result = {}
-    local primitiveClass = StaticFindObject(PRIMITIVE_COMPONENT_CLASS)
-    if not IsObjectValid(actor) or not IsObjectValid(primitiveClass) then
+    local meshClass = StaticFindObject(MESH_COMPONENT_CLASS)
+    if not IsObjectValid(actor) or not IsObjectValid(meshClass) then
         return result
     end
 
     local components = nil
     local ok = pcall(function()
-        components = actor:GetComponentsByClass(primitiveClass)
+        components = actor:K2_GetComponentsByClass(meshClass)
     end)
+    if not ok or components == nil then
+        components = nil
+        ok = pcall(function()
+            components = actor:GetComponentsByClass(meshClass)
+        end)
+    end
     if not ok or components == nil then
         return result
     end
 
-    if type(components) == "table" then
-        for _, component in pairs(components) do
-            component = ParamValue(component)
-            if IsObjectValid(component) then
-                table.insert(result, component)
-            end
-        end
-        return result
-    end
-
-    pcall(function()
-        components:ForEach(function(_, component)
-            component = ParamValue(component)
-            if IsObjectValid(component) then
-                table.insert(result, component)
-            end
-        end)
-    end)
+    components = ParamValue(components)
+    AppendObjectCollection(result, {}, components)
     return result
 end
 
@@ -3222,7 +3555,6 @@ local function ReadComponentOutlineState(component)
     if not IsObjectValid(component) then
         return false, 0, false
     end
-
     local enabled = false
     local stencil = 0
     local enabledOk = pcall(function() enabled = component.bRenderCustomDepth == true end)
@@ -3230,166 +3562,418 @@ local function ReadComponentOutlineState(component)
     return enabled, stencil, enabledOk and stencilOk
 end
 
-local function IsMarkerOutlineState(enabled, stencil)
-    return enabled == true and tonumber(stencil) == tonumber(Config.EntityDirectStencilValue or 250)
+local function IsDirectEntityOutlineState(enabled, stencil)
+    return enabled == true
+        and tonumber(stencil) == tonumber(Config.EntityDirectStencilValue or 250)
 end
 
-local function ObserveExternalOutlineState(componentRecord)
-    if Config.TrackExternalOutlineState ~= true then
-        return false
-    end
-    local enabled, stencil, readOk = ReadComponentOutlineState(componentRecord.Component)
-    if not readOk or IsMarkerOutlineState(enabled, stencil) then
-        return false
-    end
-
-    if componentRecord.LastExternalRenderCustomDepth ~= enabled
-        or componentRecord.LastExternalStencilValue ~= stencil
-    then
-        componentRecord.LastExternalRenderCustomDepth = enabled
-        componentRecord.LastExternalStencilValue = stencil
-        componentRecord.ExternalRevision = (componentRecord.ExternalRevision or 0) + 1
-        return true
-    end
-    return false
-end
-
-local function ApplyDirectEntityOutline(targetObject)
-    local targetKey = ObjectKey(targetObject)
-    if not targetKey then
-        return false
-    end
-
-    local record = state.directEntityOutlines[targetKey]
-    if not record then
-        record = { Components = {}, ExpiresAt = 0.0, ExpiresAtWallTime = 0 }
-        local seenComponents = {}
-        local primitiveClass = StaticFindObject(PRIMITIVE_COMPONENT_CLASS)
-        local meshClass = StaticFindObject(MESH_COMPONENT_CLASS)
-        local function AddOutlineComponent(component)
-            if not IsObjectValid(component)
-                or not IsObjectValid(primitiveClass)
-                or not IsObjectValid(meshClass)
-            then
-                return
-            end
-            local isPrimitive = false
-            pcall(function() isPrimitive = component:IsA(primitiveClass) end)
-            if not isPrimitive then
-                return
-            end
-            -- Collision volumes and AbioticTargetingComponent can inherit from
-            -- PrimitiveComponent and accept CustomDepth writes, but render no
-            -- visible surface. Count only real MeshComponents as outline work.
-            local isMesh = false
-            pcall(function() isMesh = component:IsA(meshClass) end)
-            if not isMesh then
-                return
-            end
-            if GetObjectClassName(component, ""):find("AbioticTargetingComponent", 1, true) then
-                return
-            end
-            local componentKey = ObjectKey(component) or tostring(component)
-            if seenComponents[componentKey] then
-                return
-            end
-            seenComponents[componentKey] = true
-
-            local originalEnabled, originalStencil = ReadComponentOutlineState(component)
-            table.insert(record.Components, {
-                Component = component,
-                RenderCustomDepth = originalEnabled,
-                StencilValue = originalStencil,
-                LastExternalRenderCustomDepth = originalEnabled,
-                LastExternalStencilValue = originalStencil,
-                ExternalRevision = 0,
-            })
+local function CollectEntityOutlineActors(rootActor)
+    local actors = {}
+    local seen = {}
+    local function AddActor(actor)
+        if not IsActorObject(actor) then
+            return
         end
-
-        -- A complex interaction target can itself be the hit PrimitiveComponent.
-        -- In that case only this component is outlined, never its owning Actor.
-        AddOutlineComponent(targetObject)
-
-        if IsActorObject(targetObject) then
-            for _, component in ipairs(CollectPrimitiveComponents(targetObject)) do
-                AddOutlineComponent(component)
-            end
-
-            local rootComponent = nil
-            pcall(function() rootComponent = targetObject:GetRootComponent() end)
-            AddOutlineComponent(rootComponent)
-
-            local firstPrimitive = nil
-            if IsObjectValid(primitiveClass) then
-                pcall(function() firstPrimitive = targetObject:GetComponentByClass(primitiveClass) end)
-            end
-            AddOutlineComponent(firstPrimitive)
-
-            -- Some Blueprint Actors expose visible meshes as named properties
-            -- even when UE4SS cannot enumerate their component TArray.
-            for _, propertyName in ipairs(Config.EntityMeshProperties or { "FurnitureMesh" }) do
-                local component = nil
-                pcall(function() component = targetObject[propertyName] end)
-                AddOutlineComponent(component)
-            end
+        local key = ObjectKey(actor)
+        if key and not seen[key] then
+            seen[key] = true
+            table.insert(actors, actor)
         end
-        state.directEntityOutlines[targetKey] = record
     end
 
-    local now = Now(targetObject)
-    record.TargetObject = targetObject
-    record.ExpiresAt = now + Config.MarkerDuration
-    record.ExpiresAtWallTime = os.time() + math.ceil(Config.MarkerDuration)
-    record.NextRefreshAt = now + (Config.EntityOutlineRefreshInterval or 0.25)
-    local applied = 0
-    for _, componentRecord in ipairs(record.Components) do
-        local component = componentRecord.Component
-        if IsObjectValid(component) then
-            local componentOk = pcall(function()
-                component:SetCustomDepthStencilValue(Config.EntityDirectStencilValue or 250)
-                component:SetRenderCustomDepth(true)
+    AddActor(rootActor)
+    if Config.EntityOutlineIncludeChildActors == true then
+        local children = {}
+        pcall(function() rootActor:GetAllChildActors(children, true) end)
+        if type(children) == "table" then
+            for _, child in pairs(children) do
+                AddActor(ParamValue(child))
+            end
+        elseif children ~= nil then
+            pcall(function()
+                children:ForEach(function(_, child)
+                    AddActor(ParamValue(child))
+                end)
             end)
-            if componentOk then
-                applied = applied + 1
-            end
-            local enabled, stencil, readOk = ReadComponentOutlineState(component)
-            local registered = nil
-            local visible = nil
-            local hiddenInGame = nil
-            pcall(function() registered = component:IsRegistered() end)
-            pcall(function() visible = component:IsVisible() end)
-            pcall(function() hiddenInGame = component.bHiddenInGame end)
-            Debug(string.format(
-                "Direct outline component state: target=%s component=%s class=%s write_ok=%s read_ok=%s custom_depth=%s stencil=%s registered=%s visible=%s hidden=%s",
-                tostring(targetKey),
-                tostring(ObjectKey(component)),
-                GetObjectClassName(component, "UnknownComponent"),
-                tostring(componentOk),
-                tostring(readOk),
-                tostring(enabled),
-                tostring(stencil),
-                tostring(registered),
-                tostring(visible),
-                tostring(hiddenInGame)
-            ))
         end
     end
-
-    Debug(string.format("Direct entity outline applied to %d primitive components", applied))
-    return applied > 0
+    return actors
 end
 
-local function ShouldForceNativeOutlineInitialization(actor)
-    if not IsActorObject(actor) then
+local function ShouldLogOutlineStructure(actor)
+    if Config.OutlineStructureDiagnostics ~= true or not IsActorObject(actor) then
         return false
     end
     local className = GetObjectClassName(actor, "")
-    for _, pattern in ipairs(Config.ForceNativeOutlineActorClassPatterns or {}) do
+    for _, pattern in ipairs(Config.OutlineStructureDiagnosticActorPatterns or {}) do
         if type(pattern) == "string" and pattern ~= "" and className:find(pattern, 1, true) then
-            return true
+            local key = ObjectKey(actor)
+            if key and not state.outlineStructureDiagnosedTargets[key] then
+                state.outlineStructureDiagnosedTargets[key] = true
+                return true
+            end
+            return false
         end
     end
     return false
+end
+
+local function ReadDiagnosticMethod(object, methodName)
+    if not IsObjectValid(object) then
+        return nil, false, "invalid_object"
+    end
+    local value = nil
+    local ok, errorMessage = pcall(function()
+        value = object[methodName](object)
+    end)
+    return ParamValue(value), ok, ok and "ok" or tostring(errorMessage)
+end
+
+local function LogOutlineStructureDiagnostics(rootActor)
+    if not ShouldLogOutlineStructure(rootActor) then
+        return
+    end
+
+    local maxActors = math.max(1, tonumber(Config.OutlineStructureDiagnosticMaxActors) or 24)
+    local maxComponents = math.max(1, tonumber(Config.OutlineStructureDiagnosticMaxComponentsPerActor) or 64)
+    local actorComponentClass = StaticFindObject(ACTOR_COMPONENT_CLASS)
+    local meshClass = StaticFindObject(MESH_COMPONENT_CLASS)
+    local primitiveClass = StaticFindObject(PRIMITIVE_COMPONENT_CLASS)
+    local queue = {}
+    local actors = {}
+    local actorSeen = {}
+    local componentSeen = {}
+    local relations = {}
+
+    local function AddActor(actor, relation, source)
+        actor = ParamValue(actor)
+        if not IsActorObject(actor) then
+            return false
+        end
+        local key = ObjectKey(actor)
+        if not key or actorSeen[key] or #actors >= maxActors then
+            return false
+        end
+        actorSeen[key] = true
+        table.insert(actors, actor)
+        table.insert(queue, actor)
+        table.insert(relations, string.format(
+            "relation=%s source=%s target=%s",
+            tostring(relation or "root"),
+            tostring(ObjectKey(source) or "None"),
+            tostring(key)
+        ))
+        return true
+    end
+
+    AddActor(rootActor, "root", nil)
+    Log(string.format(
+        "Outline structure diagnostic begin: root=%s class=%s max_actors=%d max_components_per_actor=%d actor_component_class=%s mesh_class=%s primitive_class=%s",
+        tostring(ObjectKey(rootActor)),
+        tostring(GetObjectClassName(rootActor, "UnknownClass")),
+        maxActors,
+        maxComponents,
+        tostring(IsObjectValid(actorComponentClass)),
+        tostring(IsObjectValid(meshClass)),
+        tostring(IsObjectValid(primitiveClass))
+    ))
+
+    local queueIndex = 1
+    while queueIndex <= #queue and #actors <= maxActors do
+        local actor = queue[queueIndex]
+        queueIndex = queueIndex + 1
+
+        local owner, ownerOk, ownerStatus = ReadDiagnosticMethod(actor, "GetOwner")
+        local attachParent, attachOk, attachStatus = ReadDiagnosticMethod(actor, "GetAttachParentActor")
+        local parentActor, parentOk, parentStatus = ReadDiagnosticMethod(actor, "GetParentActor")
+        local rootComponent = ParamValue(ReadDiagnosticProperty(actor, "RootComponent"))
+        Log(string.format(
+            "Outline structure actor: index=%d actor=%s class=%s owner=%s owner_call=%s attach_parent_actor=%s attach_call=%s parent_actor=%s parent_call=%s root_component=%s",
+            queueIndex - 1,
+            tostring(ObjectKey(actor)),
+            tostring(GetObjectClassName(actor, "UnknownClass")),
+            tostring(ObjectKey(owner) or "None"),
+            tostring(ownerOk and "ok" or ownerStatus),
+            tostring(ObjectKey(attachParent) or "None"),
+            tostring(attachOk and "ok" or attachStatus),
+            tostring(ObjectKey(parentActor) or "None"),
+            tostring(parentOk and "ok" or parentStatus),
+            tostring(ObjectKey(rootComponent) or "None")
+        ))
+
+        local childActors = {}
+        local childOk, childError = pcall(function() actor:GetAllChildActors(childActors, false) end)
+        local childResults = {}
+        AppendObjectCollection(childResults, {}, childActors)
+        Log(string.format(
+            "Outline structure collection: actor=%s kind=child_actors call=%s count=%d error=%s",
+            tostring(ObjectKey(actor)), tostring(childOk), #childResults, tostring(childOk and "None" or childError)
+        ))
+        for _, child in ipairs(childResults) do
+            AddActor(child, "child_actor", actor)
+        end
+
+        local attachedActors = {}
+        local attachedSignature = "recursive_include_descendants"
+        local attachedOk, attachedError = pcall(function()
+            actor:GetAttachedActors(attachedActors, true, true)
+        end)
+        local attachedResults = {}
+        AppendObjectCollection(attachedResults, {}, attachedActors)
+        Log(string.format(
+            "Outline structure collection: actor=%s kind=attached_actors signature=%s call=%s count=%d error=%s",
+            tostring(ObjectKey(actor)), tostring(attachedSignature), tostring(attachedOk), #attachedResults,
+            tostring(attachedOk and "None" or attachedError)
+        ))
+        for _, attached in ipairs(attachedResults) do
+            AddActor(attached, "attached_actor", actor)
+        end
+
+        local loggedComponents = 0
+        local function LogComponentCollection(collectionKind, componentClass)
+            local componentCollection = nil
+            local collectionRoute = "K2_GetComponentsByClass"
+            local componentsOk = false
+            local componentsError = "component_class_missing"
+            local primaryError = "None"
+            if IsObjectValid(componentClass) then
+                componentsOk, componentsError = pcall(function()
+                    componentCollection = actor:K2_GetComponentsByClass(componentClass)
+                end)
+                componentCollection = ParamValue(componentCollection)
+                if componentsOk and componentCollection == nil then
+                    componentsOk = false
+                    componentsError = "nil_result"
+                end
+            end
+
+            if not componentsOk then
+                primaryError = tostring(componentsError)
+                collectionRoute = "GetComponentsByClass_fallback"
+                componentsOk, componentsError = pcall(function()
+                    componentCollection = actor:GetComponentsByClass(componentClass)
+                end)
+                componentCollection = ParamValue(componentCollection)
+            end
+
+            local componentResults = {}
+            AppendObjectCollection(componentResults, {}, componentCollection)
+            Log(string.format(
+                "Outline structure collection: actor=%s kind=%s route=%s call=%s count=%d primary_error=%s error=%s",
+                tostring(ObjectKey(actor)), tostring(collectionKind), tostring(collectionRoute),
+                tostring(componentsOk), #componentResults, tostring(primaryError),
+                tostring(componentsOk and "None" or componentsError)
+            ))
+
+            for _, component in ipairs(componentResults) do
+                if loggedComponents >= maxComponents then
+                    break
+                end
+                local componentKey = ObjectKey(component) or tostring(component)
+                if not componentSeen[componentKey] then
+                    componentSeen[componentKey] = true
+                    loggedComponents = loggedComponents + 1
+                    local registered, registeredOk, registeredStatus = ReadDiagnosticMethod(component, "IsRegistered")
+                    local visible, visibleOk, visibleStatus = ReadDiagnosticMethod(component, "IsVisible")
+                    local active, activeOk, activeStatus = ReadDiagnosticMethod(component, "IsActive")
+                    local componentOwner, componentOwnerOk, componentOwnerStatus = ReadDiagnosticMethod(component, "GetOwner")
+                    local attachParentComponent, attachComponentOk, attachComponentStatus = ReadDiagnosticMethod(component, "GetAttachParent")
+                    local childActor, childActorOk, childActorStatus = ReadDiagnosticMethod(component, "GetChildActor")
+                    local isMesh = false
+                    if IsObjectValid(meshClass) then
+                        pcall(function() isMesh = component:IsA(meshClass) end)
+                    end
+                    local hiddenInGame = ReadDiagnosticProperty(component, "bHiddenInGame")
+                    local customDepth = ReadDiagnosticProperty(component, "bRenderCustomDepth")
+                    local stencil = ReadDiagnosticProperty(component, "CustomDepthStencilValue")
+                    Log(string.format(
+                        "Outline structure component: actor=%s collection=%s index=%d component=%s class=%s owner=%s owner_call=%s attach_parent=%s attach_call=%s registered=%s registered_call=%s visible=%s visible_call=%s hidden_in_game=%s active=%s active_call=%s is_mesh=%s custom_depth=%s stencil=%s child_actor=%s child_actor_call=%s",
+                        tostring(ObjectKey(actor)), tostring(collectionKind), loggedComponents, tostring(componentKey),
+                        tostring(GetObjectClassName(component, "UnknownClass")),
+                        tostring(ObjectKey(componentOwner) or "None"), tostring(componentOwnerOk and "ok" or componentOwnerStatus),
+                        tostring(ObjectKey(attachParentComponent) or "None"), tostring(attachComponentOk and "ok" or attachComponentStatus),
+                        tostring(registered), tostring(registeredOk and "ok" or registeredStatus),
+                        tostring(visible), tostring(visibleOk and "ok" or visibleStatus),
+                        tostring(hiddenInGame), tostring(active), tostring(activeOk and "ok" or activeStatus),
+                        tostring(isMesh), tostring(customDepth), tostring(stencil),
+                        tostring(ObjectKey(childActor) or "None"), tostring(childActorOk and "ok" or childActorStatus)
+                    ))
+                    if IsActorObject(childActor) then
+                        AddActor(childActor, "child_actor_component", actor)
+                    end
+                end
+            end
+        end
+
+        LogComponentCollection("mesh_components", meshClass)
+        LogComponentCollection("primitive_components", primitiveClass)
+        LogComponentCollection("actor_components", actorComponentClass)
+
+        for _, propertyName in ipairs(Config.EntityMeshProperties or {}) do
+            local propertyValue = ParamValue(ReadDiagnosticProperty(actor, propertyName))
+            if IsObjectValid(propertyValue) then
+                Log(string.format(
+                    "Outline structure property: actor=%s property=%s value=%s class=%s visible_mesh=%s",
+                    tostring(ObjectKey(actor)), tostring(propertyName), tostring(ObjectKey(propertyValue)),
+                    tostring(GetObjectClassName(propertyValue, "UnknownClass")),
+                    tostring(IsVisibleMeshComponent(propertyValue))
+                ))
+            end
+        end
+    end
+
+    for _, relation in ipairs(relations) do
+        Log("Outline structure relation: " .. relation)
+    end
+    Log(string.format(
+        "Outline structure diagnostic end: root=%s actors=%d relations=%d actor_limit_reached=%s",
+        tostring(ObjectKey(rootActor)), #actors, #relations, tostring(#actors >= maxActors)
+    ))
+end
+
+local function RestoreDirectEntityOutlineByAnchor(anchorKey, reason)
+    local record = state.directEntityOutlines[anchorKey]
+    if not record then
+        return false
+    end
+    state.directEntityOutlines[anchorKey] = nil
+
+    local startedAt = os.clock()
+    local restored = 0
+    local released = 0
+    for _, componentRecord in ipairs(record.Components) do
+        local component = componentRecord.Component
+        if IsObjectValid(component) then
+            local enabled, stencil, readOk = ReadComponentOutlineState(component)
+            if readOk and IsDirectEntityOutlineState(enabled, stencil) then
+                local restoreOk = pcall(function()
+                    component:SetCustomDepthStencilValue(componentRecord.StencilValue)
+                    component:SetRenderCustomDepth(componentRecord.RenderCustomDepth)
+                end)
+                if restoreOk then
+                    restored = restored + 1
+                end
+            else
+                -- Any state different from the one-shot marker write belongs to
+                -- the game or another Mod. Never overwrite it during cleanup.
+                released = released + 1
+            end
+        end
+    end
+    Log(string.format(
+        "One-shot entity outline removed: anchor=%s target=%s restored=%d released=%d components=%d reason=%s elapsed_ms=%.3f",
+        tostring(anchorKey),
+        tostring(ObjectKey(record.Target) or "None"),
+        restored,
+        released,
+        #record.Components,
+        tostring(reason or "Unknown"),
+        (os.clock() - startedAt) * 1000.0
+    ))
+    return true
+end
+
+local function ApplyDirectEntityOutline(anchor, targetObject)
+    local anchorKey = ObjectKey(anchor)
+    if not anchorKey or not IsObjectValid(targetObject) then
+        return false
+    end
+    local existing = state.directEntityOutlines[anchorKey]
+    if existing then
+        return true
+    end
+
+    local startedAt = os.clock()
+    local components = {}
+    local seen = {}
+    local function AddMesh(component)
+        if not IsVisibleMeshComponent(component) then
+            return
+        end
+        local key = ObjectKey(component) or tostring(component)
+        if seen[key] then
+            return
+        end
+        seen[key] = true
+        table.insert(components, component)
+    end
+
+    local actorCount = 0
+    AddMesh(targetObject)
+    if IsActorObject(targetObject) then
+        LogOutlineStructureDiagnostics(targetObject)
+        local outlineActors = CollectEntityOutlineActors(targetObject)
+        actorCount = #outlineActors
+        for _, actor in ipairs(outlineActors) do
+            for _, component in ipairs(CollectMeshComponents(actor)) do
+                AddMesh(component)
+            end
+            for _, propertyName in ipairs(Config.EntityMeshProperties or {}) do
+                local component = nil
+                pcall(function() component = actor[propertyName] end)
+                AddMesh(component)
+            end
+        end
+    end
+
+    local appliedRecords = {}
+    local stencilValue = Config.EntityDirectStencilValue or 250
+    for _, component in ipairs(components) do
+        local originalEnabled, originalStencil, originalReadOk = ReadComponentOutlineState(component)
+        if originalReadOk then
+            local writeOk = pcall(function()
+                component:SetCustomDepthStencilValue(stencilValue)
+                component:SetRenderCustomDepth(true)
+            end)
+            local enabled, stencil, verifyOk = ReadComponentOutlineState(component)
+            if writeOk and verifyOk and IsDirectEntityOutlineState(enabled, stencil) then
+                table.insert(appliedRecords, {
+                    Component = component,
+                    RenderCustomDepth = originalEnabled,
+                    StencilValue = originalStencil,
+                })
+            else
+                -- We cannot safely own a write that cannot be verified. Restore
+                -- the captured state immediately and leave it out of cleanup.
+                pcall(function()
+                    component:SetCustomDepthStencilValue(originalStencil)
+                    component:SetRenderCustomDepth(originalEnabled)
+                end)
+            end
+        end
+    end
+
+    if #appliedRecords == 0 then
+        Log(string.format(
+            "One-shot entity outline skipped: anchor=%s target=%s actors=%d visible_meshes=%d elapsed_ms=%.3f",
+            tostring(anchorKey),
+            tostring(ObjectKey(targetObject) or "None"),
+            actorCount,
+            #components,
+            (os.clock() - startedAt) * 1000.0
+        ))
+        return false
+    end
+
+    local now = Now(targetObject)
+    state.directEntityOutlines[anchorKey] = {
+        Anchor = anchor,
+        Target = targetObject,
+        Components = appliedRecords,
+        ExpiresAt = now + Config.MarkerDuration,
+        ExpiresAtWallTime = os.time() + math.ceil(Config.MarkerDuration),
+    }
+    Log(string.format(
+        "One-shot entity outline applied: anchor=%s target=%s actors=%d visible_meshes=%d applied=%d child_actors=%s elapsed_ms=%.3f",
+        tostring(anchorKey),
+        tostring(ObjectKey(targetObject) or "None"),
+        actorCount,
+        #components,
+        #appliedRecords,
+        tostring(Config.EntityOutlineIncludeChildActors == true),
+        (os.clock() - startedAt) * 1000.0
+    ))
+    return true
 end
 
 local function SpawnAnchor(character, hit, markerIndex)
@@ -3419,7 +4003,7 @@ local function SpawnAnchor(character, hit, markerIndex)
         return nil
     end
 
-    pcall(function() LoadAsset(SPHERE_MESH_PATH) end)
+    state.GetAsset(SPHERE_MESH_PATH)
 
     local anchorScale = isEntityMarker and (Config.EntityAnchorScale or 0.01) or Config.SphereScale
     local scale = MakeVector(anchorScale, anchorScale, anchorScale)
@@ -3489,6 +4073,7 @@ local function SpawnAnchor(character, hit, markerIndex)
 
     local anchorKey = ObjectKey(anchor)
     if anchorKey then
+        state.anchorLifetimes[anchorKey] = { Anchor = anchor, ExpiresAt = Now(anchor) + Config.MarkerDuration }
         state.markerDebugInfo[anchorKey] = {
             Anchor = anchor,
             EntityTarget = entityTarget,
@@ -3598,20 +4183,50 @@ local function GetMarkerTargetKey(hit)
     return nil
 end
 
-local function RemoveActiveMarkerTargetForAnchor(anchor)
-    local anchorKey = ObjectKey(anchor)
-    if not anchorKey then
-        return
-    end
+function state.CleanupAnchor(anchorKey, reason)
+    local lifetime = state.anchorLifetimes[anchorKey]
+    local anchor = lifetime and lifetime.Anchor
+        or (state.markerDebugInfo[anchorKey] or {}).Anchor
+    RestoreDirectEntityOutlineByAnchor(anchorKey, reason)
+    RemoveMarkerWidget(anchorKey)
     local targetKey = state.serverAnchorTargetKeys[anchorKey]
-    if not targetKey then
-        return
-    end
     local record = state.activeMarkerTargets[targetKey]
     if record and record.AnchorKey == anchorKey then
         state.activeMarkerTargets[targetKey] = nil
     end
     state.serverAnchorTargetKeys[anchorKey] = nil
+    state.anchorLifetimes[anchorKey] = nil
+    state.markerDebugInfo[anchorKey] = nil
+    state.localSuccessSoundAnchors[anchorKey] = nil
+    state.processedBroadcastAnchors[anchorKey] = nil
+    state.pendingVisualizations[anchorKey] = nil
+    state.pendingBroadcasts[anchorKey] = nil
+    for _, slots in ipairs({ state.packetLocalSlots, state.serverMarkerSlots }) do
+        for slot, candidate in pairs(slots) do
+            if candidate == anchor then slots[slot] = nil end
+        end
+    end
+end
+
+function state.ResetMarkers(touchObjects)
+    if touchObjects then
+        for key in pairs(state.anchorLifetimes) do state.CleanupAnchor(key, "session_reset") end
+    end
+    for _, name in ipairs({ "anchorLifetimes", "markerDebugInfo", "localSuccessSoundAnchors",
+        "processedBroadcastAnchors", "packetLocalSlots", "serverMarkerSlots", "markerWidgets",
+        "markerWidgetSlots", "labelComponents", "labelComponentKeys", "directEntityOutlines",
+        "activeMarkerTargets", "serverAnchorTargetKeys", "pendingBroadcasts", "pendingVisualizations",
+        "serverRequestTimes", "widgetDiagnostics", "hudDrawDiagnostics", "outlineStructureDiagnosedTargets" }) do
+        state[name] = {}
+    end
+    state.primaryHudCanvas = nil
+    state.hudFont = nil
+    state.nextServerMarkerSlot = 1
+end
+
+local function RemoveActiveMarkerTargetForAnchor(anchor)
+    local anchorKey = ObjectKey(anchor)
+    if anchorKey then state.CleanupAnchor(anchorKey, "marker_anchor_removed") end
 end
 
 local function RegisterActiveMarkerTarget(targetKey, anchor)
@@ -3830,10 +4445,12 @@ local function BuildMarkerPacket(anchor, markerIndex, hit)
     }
 end
 
-local function GetMarkerPacketCarriers(character)
+local function GetMarkerPacketCarriers(character, world)
     local playerState = nil
     local gameState = nil
-    local world = UEHelpers.GetWorld()
+    if not IsObjectValid(world) then
+        pcall(function() world = character:GetWorld() end)
+    end
     pcall(function() playerState = character.PlayerState end)
     if IsObjectValid(world) then
         pcall(function() gameState = world.GameState end)
@@ -3861,13 +4478,17 @@ local function MarkerPacketSymbolActor(symbol, character, playerState, gameState
 end
 
 local function ScheduleMarkerPacketBroadcast(character, anchor, markerIndex, hit)
+    local senderKey = ObjectKey(character)
+    if not senderKey or state.packetSends[senderKey] then return false end
     local packet, packetError = BuildMarkerPacket(anchor, markerIndex, hit)
     if not packet then
         Log("Marker packet build failed: " .. tostring(packetError))
         return false
     end
 
-    local playerState, gameState = GetMarkerPacketCarriers(character)
+    local world = nil
+    pcall(function() world = character:GetWorld() end)
+    local playerState, gameState = GetMarkerPacketCarriers(character, world)
     if not IsObjectValid(character) or not IsActorObject(playerState) or not IsActorObject(gameState) then
         Log(string.format(
             "Marker packet carriers unavailable: character=%s player_state=%s game_state=%s",
@@ -3875,6 +4496,15 @@ local function ScheduleMarkerPacketBroadcast(character, anchor, markerIndex, hit
             tostring(ObjectKey(playerState) or "None"),
             tostring(ObjectKey(gameState) or "None")
         ))
+        return false
+    end
+
+    local worldIdentity = ObjectIdentity(world)
+    local characterIdentity = ObjectIdentity(character)
+    local playerStateIdentity = ObjectIdentity(playerState)
+    local gameStateIdentity = ObjectIdentity(gameState)
+    if not worldIdentity or not characterIdentity or not playerStateIdentity or not gameStateIdentity then
+        Log("Marker packet not scheduled: native_object_identity_unavailable")
         return false
     end
 
@@ -3886,7 +4516,6 @@ local function ScheduleMarkerPacketBroadcast(character, anchor, markerIndex, hit
     end
     state.packetSerial = state.packetSerial + 1
     local serial = state.packetSerial
-    local symbolDelay = math.max(1, math.floor(Config.MarkerPacketSymbolDelayMs or 4))
     local batchSize = math.max(1, math.min(8, math.floor(Config.MarkerPacketBatchSize or 4)))
     Log(string.format(
         "Marker packet scheduled: serial=%d player=%s slot=%d entity=%s precise=%s class=%d position=(%.1f,%.1f,%.1f) bits=%d symbols=%d batch_size=%d batches=%d checksum=%d carriers={character=%s player_state=%s game_state=%s}",
@@ -3909,61 +4538,55 @@ local function ScheduleMarkerPacketBroadcast(character, anchor, markerIndex, hit
         tostring(ObjectKey(gameState))
     ))
 
-    local sendNextBatch = nil
-    sendNextBatch = function(batchStartIndex)
-        ExecuteWithDelay(batchStartIndex == 1 and 0 or symbolDelay, function()
-            ExecuteInGameThread(function()
-                if not IsObjectValid(character) then
-                    Log(string.format(
-                        "Marker packet send cancelled: serial=%d next_symbol=%d/%d character invalid",
-                        serial,
-                        batchStartIndex,
-                        #wireSymbols
-                    ))
-                    return
-                end
-                local batchEndIndex = math.min(#wireSymbols, batchStartIndex + batchSize - 1)
-                for symbolIndex = batchStartIndex, batchEndIndex do
-                    local symbolValue = wireSymbols[symbolIndex]
-                    local carrier = MarkerPacketSymbolActor(
-                        symbolValue,
-                        character,
-                        playerState,
-                        gameState
-                    )
-                    local ok, sendError = pcall(function()
-                        character:Broadcast_TriggerPager(carrier)
-                    end)
-                    if not ok then
-                        Log(string.format(
-                            "Marker packet symbol send failed: serial=%d symbol=%d/%d value=%d error=%s",
-                            serial,
-                            symbolIndex,
-                            #wireSymbols,
-                            symbolValue,
-                            tostring(sendError)
-                        ))
-                        return
-                    end
-                end
-                if batchEndIndex == #wireSymbols then
-                    Log(string.format(
-                        "Marker packet send completed: serial=%d player=%s slot=%d symbols=%d batches=%d checksum=%d",
-                        serial,
-                        GetMarkerPlayerName(character),
-                        packet.Slot,
-                        #wireSymbols,
-                        math.ceil(#wireSymbols / batchSize),
-                        packet.Checksum
-                    ))
-                    return
-                end
-                sendNextBatch(batchEndIndex + 1)
-            end)
-        end)
-    end
-    sendNextBatch(1)
+    state.packetSends[senderKey] = {
+        Session = state.session, Character = character, CharacterIdentity = characterIdentity,
+        WorldIdentity = worldIdentity, PlayerStateIdentity = playerStateIdentity,
+        GameStateIdentity = gameStateIdentity, Symbols = wireSymbols,
+        Serial = serial, Index = 1, BatchSize = batchSize, Batches = 0, Broadcasts = 0,
+        StartedWall = os.time(),
+    }
     return true
+end
+
+-- One owner per sender, advanced by the existing game-thread Tick. No delayed
+-- closures retain Character/PlayerState/GameState and no second game-thread queue.
+function state.ProcessPacketSends(tickingController)
+    local world = nil
+    local controller = tickingController or state.localPlayerController
+    if IsObjectValid(controller) then pcall(function() world = controller:GetWorld() end) end
+    local worldIdentity = ObjectIdentity(world)
+    for senderKey, send in pairs(state.packetSends) do
+        local ok, errorMessage = pcall(function()
+            if send.Session ~= state.session then error("session_changed") end
+            if os.time() - send.StartedWall > 3 then error("send_timeout") end
+            if not worldIdentity then error("world_identity_unavailable") end
+            if worldIdentity ~= send.WorldIdentity then error("world_changed") end
+            local character = send.Character
+            if ObjectIdentity(character) ~= send.CharacterIdentity then error("character_changed_or_invalid") end
+            if ObjectIdentity(character:GetWorld()) ~= worldIdentity then error("character_world_changed") end
+            if ObjectIdentity(GetControllerPawn(character:GetController())) ~= send.CharacterIdentity then
+                error("character_replaced_or_unpossessed") end
+            local playerState, gameState = GetMarkerPacketCarriers(character, world)
+            if ObjectIdentity(playerState) ~= send.PlayerStateIdentity then error("player_state_changed_or_invalid") end
+            if ObjectIdentity(gameState) ~= send.GameStateIdentity then error("game_state_changed_or_invalid") end
+            send.Batches = send.Batches + 1
+            state.diagnostics.batches = state.diagnostics.batches + 1
+            local last = math.min(#send.Symbols, send.Index + send.BatchSize - 1)
+            for index = send.Index, last do
+                character:Broadcast_TriggerPager(MarkerPacketSymbolActor(
+                    send.Symbols[index], character, playerState, gameState))
+                send.Broadcasts = send.Broadcasts + 1
+                state.diagnostics.broadcasts = state.diagnostics.broadcasts + 1
+            end
+            send.Index = last + 1
+        end)
+        if not ok or send.Index > #send.Symbols then
+            state.packetSends[senderKey] = nil
+            Log(string.format("Marker packet send %s: serial=%d batches=%d broadcasts=%d error=%s",
+                ok and "completed" or "cancelled", send.Serial, send.Batches,
+                send.Broadcasts, tostring(ok and "None" or errorMessage)))
+        end
+    end
 end
 
 local function HandleServerPagerPre(contextParam, linkedActorParam)
@@ -3973,6 +4596,7 @@ local function HandleServerPagerPre(contextParam, linkedActorParam)
     if not IsObjectValid(character) or not HasAuthority(character) or not IsModRequest(linkedActor) then
         return
     end
+    if state.packetSends[ObjectKey(character)] then return end
 
     Log(string.format(
         "Multiplayer server request received: player=%s character=%s authority=%s world=%s linked_valid=%s",
@@ -3994,7 +4618,7 @@ local function HandleServerPagerPre(contextParam, linkedActorParam)
         return
     end
 
-    local startLocation, direction = GetServerViewRay(character)
+    local startLocation, direction, raySource = GetServerViewRay(character)
     if not startLocation or not direction then
         Log("Server could not obtain the requesting player's view ray")
         return
@@ -4008,6 +4632,11 @@ local function HandleServerPagerPre(contextParam, linkedActorParam)
 
     hit = ResolveHierarchicalMarkerTarget(hit)
     hit = ResolveInvisibleEntityWorldFallback(hit)
+    if Config.TraceSelectionDiagnostics == true then
+        Log(string.format("Authoritative target: ray=%s source=%s target=%s component=%s distance=%.1f",
+            tostring(raySource), tostring(hit.Source), tostring(ObjectKey(hit.Actor)),
+            tostring(ObjectKey(hit.Component)), math.sqrt(hit.DistanceSquared or 0)))
+    end
 
     Debug(string.format(
         "Trace hit: source=%s distance=%.1f classification=%s actor=%s actor_class=%s component=%s component_class=%s",
@@ -4085,52 +4714,38 @@ ConfigureBroadcastVisualization = function(anchor, character, phase)
     local entityMarker = IsEntityAnchor(anchor)
     if entityMarker then
         local anchorHidden = ConfigureEntityAnchor(anchor)
-        local targetActor = ResolveEntityTarget(anchor)
+        local targetActor, rayComponent = ResolveEntityTarget(anchor, character)
         if not IsObjectValid(targetActor) then
             Debug(string.format("%s entity marker is waiting for its replicated target", phase))
             return false
         end
 
         local preciseComponent = IsPreciseComponentAnchor(anchor)
-        local visualTarget = preciseComponent and ResolvePreciseComponentTarget(anchor, targetActor) or targetActor
+        local visualTarget = preciseComponent
+            and ResolvePreciseComponentTarget(anchor, targetActor, rayComponent)
+            or targetActor
         if preciseComponent and not IsObjectValid(visualTarget) then
             Debug(string.format("%s precise component marker is waiting for its interaction component", phase))
             return false
         end
 
-        -- Resource micro-nodes can expose a writable StaticMeshComponent while
-        -- remaining absent from the outline pass until the game's native
-        -- component initializes them. Keep this targeted by actor class.
-        local forceNativeInitialization = ShouldForceNativeOutlineInitialization(targetActor)
-        local nativeOutline = false
-        local nativeOutlineComponent = nil
-        if forceNativeInitialization then
-            nativeOutline, nativeOutlineComponent = EnsureOutlineComponent(targetActor)
-        end
-        -- Prefer direct mesh state for deterministic refresh and restoration.
-        -- Native initialization above runs first so this write remains final.
-        local directOutline = ApplyDirectEntityOutline(visualTarget)
-        if not directOutline and not nativeOutline and IsActorObject(visualTarget) then
-            nativeOutline, nativeOutlineComponent = EnsureOutlineComponent(targetActor)
-        end
-        if IsObjectValid(nativeOutlineComponent) then
-            LogOutlineDiagnostics(targetActor, nativeOutlineComponent, "native_fallback", "existing")
-        end
-        local label = EnsureMarkerLabel(anchor, character, visualTarget)
+        -- Apply Custom Depth to the real visible Meshes exactly once. There is
+        -- no Lua refresh while the Mark is active; cleanup restores captured
+        -- values only when the component still has this exact marker state.
+        local directOutline = ApplyDirectEntityOutline(anchor, visualTarget)
+        local label = EnsureMarkerLabel(anchor, character, targetActor)
         RegisterActiveMarkerTarget(ObjectKey(visualTarget), anchor)
         Debug(string.format(
-            "%s entity visualization result: anchor_hidden=%s precise_component=%s forced_native=%s native_outline=%s direct_outline=%s label=%s target=%s visual_target=%s",
+            "%s entity visualization result: anchor_hidden=%s precise_component=%s direct_outline=%s label=%s target=%s visual_target=%s",
             phase,
             tostring(anchorHidden),
             tostring(preciseComponent),
-            tostring(forceNativeInitialization),
-            tostring(nativeOutline),
             tostring(directOutline),
             tostring(label),
             tostring(ObjectKey(targetActor)),
             tostring(ObjectKey(visualTarget))
         ))
-        return nativeOutline or directOutline
+        return directOutline
     end
 
     local meshConfigured = ConfigureAnchor(anchor)
@@ -4261,7 +4876,7 @@ local function SpawnClientLocalPacketAnchor(character, packet)
         return nil, "spawn dependencies unavailable"
     end
 
-    pcall(function() LoadAsset(SPHERE_MESH_PATH) end)
+    state.GetAsset(SPHERE_MESH_PATH)
     local anchorScale = packet.Entity and (Config.EntityAnchorScale or 0.01) or Config.SphereScale
     local scale = MakeVector(anchorScale, anchorScale, anchorScale)
     local pitch = packet.Precise and (Config.ComponentMarkerPitch or 37.0) or 0.0
@@ -4306,6 +4921,7 @@ local function SpawnClientLocalPacketAnchor(character, packet)
 
     local anchorKey = ObjectKey(anchor)
     if anchorKey then
+        state.anchorLifetimes[anchorKey] = { Anchor = anchor, ExpiresAt = Now(anchor) + Config.MarkerDuration }
         state.markerDebugInfo[anchorKey] = {
             Anchor = anchor,
             Classification = packet.Entity and "PacketEntity" or "PacketWorld",
@@ -4465,15 +5081,18 @@ local function TryConsumeMarkerPacketSymbol(character, linkedActor)
     local symbol = ClassifyMarkerPacketSymbol(linkedActor, carriers)
     local now = Now(character)
     if receiver
-        and receiver.Active
         and now - (receiver.LastAt or receiver.StartedAt or now) > (Config.MarkerPacketReceiveTimeout or 2.0)
     then
-        Log(string.format(
-            "Marker packet receive timeout: sender=%s received=%d expected=%d",
-            GetMarkerPlayerName(character),
-            #(receiver.Symbols or {}),
-            receiver.ExpectedSymbols or 0
-        ))
+        if receiver.Active then
+            Log(string.format(
+                "Marker packet receive timeout: sender=%s received=%d expected=%d",
+                GetMarkerPlayerName(character),
+                #(receiver.Symbols or {}),
+                receiver.ExpectedSymbols or 0
+            ))
+        else
+            Debug("Marker packet preamble expired: sender=" .. GetMarkerPlayerName(character))
+        end
         state.packetReceivers[senderKey] = nil
         receiver = nil
     end
@@ -4556,11 +5175,14 @@ local function TryConsumeMarkerPacketSymbol(character, linkedActor)
             ))
         else
             receiver.PreambleStage = 1
+            receiver.StartedAt = receiver.StartedAt or now
+            receiver.LastAt = now
             state.packetReceivers[senderKey] = receiver
         end
         return true
     elseif symbol == 1 and receiver.PreambleStage == 1 then
         receiver.PreambleStage = 2
+        receiver.LastAt = now
         state.packetReceivers[senderKey] = receiver
         return true
     end
@@ -4569,33 +5191,27 @@ local function TryConsumeMarkerPacketSymbol(character, linkedActor)
     return false
 end
 
-ProcessPendingMarkerWork = function()
-    local world = UEHelpers.GetWorld()
-    if not IsObjectValid(world) then
-        return
-    end
-    local now = Now(world)
+ProcessPendingMarkerWork = function(cleanupDue)
+    if not HasMarkerMaintenanceWork() then return end
+    if not cleanupDue and not HasTableEntries(state.packetReceivers)
+        and not HasTableEntries(state.pendingBroadcasts)
+        and not HasTableEntries(state.pendingVisualizations) then return end
+    state.diagnostics.maintenance = state.diagnostics.maintenance + 1
+    local now = Now(state.localPlayerController)
 
     for senderKey, receiver in pairs(state.packetReceivers) do
-        if receiver.Active
-            and now - (receiver.LastAt or receiver.StartedAt or now) > (Config.MarkerPacketReceiveTimeout or 2.0)
-        then
-            Log(string.format(
-                "Marker packet receive timeout during tick: sender=%s received=%d expected=%d",
-                tostring(senderKey),
-                #(receiver.Symbols or {}),
-                receiver.ExpectedSymbols or 0
-            ))
+        if now - (receiver.LastAt or receiver.StartedAt or now) > (Config.MarkerPacketReceiveTimeout or 2.0) then
+            if receiver.Active then
+                Log(string.format(
+                    "Marker packet receive timeout during tick: sender=%s received=%d expected=%d",
+                    tostring(senderKey),
+                    #(receiver.Symbols or {}),
+                    receiver.ExpectedSymbols or 0
+                ))
+            else
+                Debug("Marker packet preamble expired during tick: sender=" .. tostring(senderKey))
+            end
             state.packetReceivers[senderKey] = nil
-        end
-    end
-    for senderKey, carriers in pairs(state.packetCarrierCache) do
-        if not carriers
-            or not IsObjectValid(carriers.Character)
-            or not IsObjectValid(carriers.PlayerState)
-            or not IsObjectValid(carriers.GameState)
-        then
-            state.packetCarrierCache[senderKey] = nil
         end
     end
 
@@ -4635,59 +5251,25 @@ ProcessPendingMarkerWork = function()
         end
     end
 
+    if not cleanupDue then return end
+    for senderKey in pairs(state.packetCarrierCache) do
+        if not state.packetReceivers[senderKey] then state.packetCarrierCache[senderKey] = nil end
+    end
+    for anchorKey, lifetime in pairs(state.anchorLifetimes) do
+        if now >= lifetime.ExpiresAt or not IsObjectValid(lifetime.Anchor) then
+            state.CleanupAnchor(anchorKey, "lifetime_or_destroyed")
+        end
+    end
     local wallTimeNow = os.time()
-    for targetKey, record in pairs(state.directEntityOutlines) do
-        local expiredByWorld = now >= (record.ExpiresAt or 0.0)
-        local expiredByWallTime = wallTimeNow >= (record.ExpiresAtWallTime or math.huge)
-        if expiredByWorld or expiredByWallTime then
-            local restored = 0
-            local released = 0
-            for _, componentRecord in ipairs(record.Components) do
-                local component = componentRecord.Component
-                if IsObjectValid(component) then
-                    local enabled, stencil, readOk = ReadComponentOutlineState(component)
-                    if readOk and IsMarkerOutlineState(enabled, stencil) then
-                        local restoredOk = pcall(function()
-                            component:SetCustomDepthStencilValue(componentRecord.LastExternalStencilValue)
-                            component:SetRenderCustomDepth(componentRecord.LastExternalRenderCustomDepth)
-                        end)
-                        if restoredOk then
-                            restored = restored + 1
-                        end
-                    elseif readOk then
-                        -- The game or another mod has already taken ownership.
-                        -- Do not overwrite the newer state during cleanup.
-                        released = released + 1
-                    end
-                end
-            end
-            state.directEntityOutlines[targetKey] = nil
-            Debug(string.format(
-                "Direct entity outline expired: target=%s restored=%d released=%d components=%d world_expired=%s wall_time_expired=%s",
-                tostring(targetKey),
-                restored,
-                released,
-                #record.Components,
-                tostring(expiredByWorld),
-                tostring(expiredByWallTime)
-            ))
-        elseif now >= (record.NextRefreshAt or 0.0) then
-            local reapplied = 0
-            for _, componentRecord in ipairs(record.Components) do
-                local component = componentRecord.Component
-                if IsObjectValid(component) then
-                    ObserveExternalOutlineState(componentRecord)
-                    local componentOk = pcall(function()
-                        component:SetCustomDepthStencilValue(Config.EntityDirectStencilValue or 250)
-                        component:SetRenderCustomDepth(true)
-                    end)
-                    if componentOk then
-                        reapplied = reapplied + 1
-                    end
-                end
-            end
-
-            record.NextRefreshAt = now + (Config.EntityOutlineRefreshInterval or 0.25)
+    for anchorKey, record in pairs(state.directEntityOutlines) do
+        local expired = now >= (record.ExpiresAt or math.huge)
+            or wallTimeNow >= (record.ExpiresAtWallTime or 0)
+        local invalid = not IsObjectValid(record.Anchor) or not IsObjectValid(record.Target)
+        if expired or invalid then
+            state.CleanupAnchor(
+                anchorKey,
+                expired and "lifetime_expired" or "object_invalid"
+            )
         end
     end
 
@@ -4700,27 +5282,8 @@ ProcessPendingMarkerWork = function()
         end
     end
 
-    for anchorKey, info in pairs(state.markerDebugInfo) do
-        if not IsObjectValid(info.Anchor) then
-            state.markerDebugInfo[anchorKey] = nil
-            state.localSuccessSoundAnchors[anchorKey] = nil
-        end
-    end
-    for anchorKey, anchor in pairs(state.localSuccessSoundAnchors) do
-        if not IsObjectValid(anchor) then
-            state.localSuccessSoundAnchors[anchorKey] = nil
-        end
-    end
-    for anchorKey, record in pairs(state.processedBroadcastAnchors) do
-        if not record or not IsObjectValid(record.Anchor) then
-            state.processedBroadcastAnchors[anchorKey] = nil
-        end
-    end
-    for slot, anchor in pairs(state.packetLocalSlots) do
-        if not IsObjectValid(anchor) then
-            state.packetLocalSlots[slot] = nil
-        end
-    end
+    -- Auxiliary tables are removed together by CleanupAnchor. They do not each
+    -- revalidate the same UObject, and expiry does not depend on IsValid flipping.
 end
 
 PlayLocalMarkerSuccessSound = function(character)
@@ -4729,11 +5292,7 @@ PlayLocalMarkerSuccessSound = function(character)
         return false, "success sound path is empty"
     end
 
-    local sound = StaticFindObject(soundPath)
-    if not IsObjectValid(sound) then
-        pcall(function() LoadAsset(soundPath) end)
-        sound = StaticFindObject(soundPath)
-    end
+    local sound = state.GetAsset(soundPath)
     if not IsObjectValid(sound) then
         return false, "success sound asset was not found: " .. soundPath
     end
@@ -4801,6 +5360,11 @@ local function HandleBroadcastPager(contextParam, linkedActorParam)
     if not isStaticMeshActor then
         Debug("Broadcast LinkedActor was not a StaticMeshActor; treating it as an original Pager call")
         return
+    end
+    if anchorKey and not state.anchorLifetimes[anchorKey] then
+        state.anchorLifetimes[anchorKey] = {
+            Anchor = linkedActor, ExpiresAt = Now(linkedActor) + Config.MarkerDuration,
+        }
     end
 
     local processed = anchorKey and state.processedBroadcastAnchors[anchorKey] or nil
@@ -4926,6 +5490,44 @@ local function RegisterHooksWithRetry(attempt)
     end)
 end
 
+local function GetFocusedTextInputWidget()
+    if Config.IgnoreMarkerWhileTyping == false then
+        return nil, nil
+    end
+
+    local classNames = Config.TextInputWidgetClasses or DEFAULT_TEXT_INPUT_WIDGET_CLASSES
+    for _, className in ipairs(classNames) do
+        local widgets = nil
+        local findOk = pcall(function()
+            widgets = FindAllOf(className) or {}
+        end)
+        if findOk and widgets then
+            for _, widget in ipairs(widgets) do
+                if IsObjectValid(widget) then
+                    local world = nil
+                    pcall(function() world = widget:GetWorld() end)
+                    if IsObjectValid(world) then
+                        local focused = false
+                        pcall(function()
+                            focused = widget:HasKeyboardFocus() == true
+                        end)
+                        if not focused then
+                            pcall(function()
+                                focused = widget:HasAnyUserFocus() == true
+                            end)
+                        end
+                        if focused then
+                            return widget, className
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return nil, nil
+end
+
 local function LocalTraceHasHit(character, playerController)
     local startLocation, direction = GetLocalCrosshairRay(playerController)
     if not startLocation or not direction then
@@ -4937,7 +5539,36 @@ local function LocalTraceHasHit(character, playerController)
 end
 
 local function RequestMarker()
-    ExecuteInGameThread(function()
+    state.diagnostics.raw = state.diagnostics.raw + 1
+    if state.requestInFlight then
+        state.diagnostics.gated = state.diagnostics.gated + 1
+        return
+    end
+    if state.inputCooldownRemaining > 0 then
+        state.diagnostics.cooldown = state.diagnostics.cooldown + 1
+        if state.cooldownWarningQueued or Config.CooldownWarningSound ~= true then
+            state.diagnostics.gated = state.diagnostics.gated + 1
+            return
+        end
+        state.cooldownWarningQueued = true
+    end
+    local token = { Session = state.session, WorldKey = state.activeWorldKey,
+        WarningOnly = state.inputCooldownRemaining > 0 }
+    state.requestInFlight = token
+    local queued, queueError = pcall(ExecuteInGameThread, function()
+        if token.Session ~= state.session or state.requestInFlight ~= token then return end
+        state.diagnostics.entered = state.diagnostics.entered + 1
+        local handled, requestError = pcall(function()
+        local focusedTextInput, focusedClass = GetFocusedTextInputWidget()
+        if IsObjectValid(focusedTextInput) then
+            Debug(string.format(
+                "Marker request ignored while typing: class=%s widget=%s",
+                tostring(focusedClass or "Unknown"),
+                tostring(ObjectKey(focusedTextInput) or "Unknown")
+            ))
+            return
+        end
+
         local playerController, character = GetVerifiedLocalPlayerContext()
         if not IsObjectValid(playerController) or not IsObjectValid(character) then
             Log("Marker request ignored: verified local PlayerController/Pawn unavailable")
@@ -4946,6 +5577,12 @@ local function RequestMarker()
 
         local now = Now(character)
         local worldKey = GetCurrentWorldKey(character)
+        if token.WorldKey and worldKey and token.WorldKey ~= worldKey then
+            ResetLocalCooldownState("QueuedRequestWorldChanged")
+            state.ResetMarkers(false)
+            state.activeWorldKey = worldKey
+            return
+        end
         local worldChanged = state.lastClientRequestWorldKey ~= nil
             and worldKey ~= nil
             and state.lastClientRequestWorldKey ~= worldKey
@@ -4960,13 +5597,21 @@ local function RequestMarker()
                 tostring(worldKey)
             ))
             ResetLocalCooldownState(worldChanged and "WorldChanged" or "TimeWentBack")
+            state.ResetMarkers(not worldChanged)
+            token.Session = state.session
+            state.requestInFlight = token
+            state.activeWorldKey = worldKey
         end
         local clientCooldown = Config.ClientCooldown or Config.PerPlayerCooldown or 3.0
         local elapsed = now - state.lastClientRequestTime
         if elapsed < clientCooldown then
+            state.diagnostics.formalRejected = state.diagnostics.formalRejected + 1
+            state.inputCooldownRemaining = clientCooldown - elapsed
             if Config.CooldownWarningSound == true
-                and now - state.lastCooldownWarningTime >= (Config.CooldownWarningSoundThrottle or 0.25)
+                and not state.cooldownWarningShown
             then
+                state.cooldownWarningShown = true
+                state.cooldownWarningQueued = true
                 state.lastCooldownWarningTime = now
                 NotifyCooldownMarkerRejected(character, clientCooldown - elapsed)
             end
@@ -4976,6 +5621,8 @@ local function RequestMarker()
             ))
             return
         end
+        -- A warning queued near expiry must never turn into a fresh marker.
+        if token.WarningOnly then return end
 
         if not LocalTraceHasHit(character, playerController) then
             Debug("Local marker trace did not hit anything")
@@ -4992,8 +5639,6 @@ local function RequestMarker()
             GetActorReplicationSnapshot(character)
         ))
 
-        state.lastClientRequestTime = now
-        state.lastClientRequestWorldKey = worldKey
         local nullActor = CreateInvalidObject()
         local ok, errorMessage = pcall(function()
             character:Server_TriggerPager(nullActor)
@@ -5004,12 +5649,26 @@ local function RequestMarker()
             return
         end
 
+        state.lastClientRequestTime = now
+        state.lastClientRequestWorldKey = worldKey
+        state.activeWorldKey = worldKey
+        state.inputCooldownRemaining = clientCooldown
+        state.cooldownWarningQueued = false
+        state.cooldownWarningShown = false
+        state.diagnostics.sent = state.diagnostics.sent + 1
         Log(string.format(
             "Multiplayer local request sent: player=%s pawn=%s",
             GetMarkerPlayerName(character),
             tostring(ObjectKey(character) or "None")
         ))
+        end)
+        if state.requestInFlight == token then state.requestInFlight = nil end
+        if not handled then Log("Marker request failed: " .. tostring(requestError)) end
     end)
+    if not queued then
+        if state.requestInFlight == token then state.requestInFlight = nil end
+        Log("Marker request queue failed: " .. tostring(queueError))
+    end
 end
 
 local function RunUniversalCollisionDebugTrace()
@@ -5301,8 +5960,11 @@ pcall(function()
         local restartedController = ParamValue(contextParam)
         local isLocalRestart = IsStrictlyLocalController(restartedController)
         if isLocalRestart then
+            local sameWorld = state.activeWorldKey == GetCurrentWorldKey(restartedController)
+            state.ResetMarkers(sameWorld)
             ClearLocalPlayerContext("LocalClientRestart")
             ResetLocalCooldownState("ClientRestart")
+            state.activeWorldKey = nil
         else
             Debug(string.format(
                 "Ignored remote ClientRestart for local state: controller=%s",

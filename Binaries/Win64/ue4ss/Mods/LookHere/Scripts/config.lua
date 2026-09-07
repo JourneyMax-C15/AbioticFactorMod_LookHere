@@ -6,9 +6,9 @@ return {
     -- equipment Actors, retrying the trace so the object behind them can win.
     MaxRequestingPlayerTraceSkips = 8,
 
-    -- Standalone query/render-helper Actors are ignored by class keyword and
-    -- retraced. Parented variants remain normal targets so furniture helpers
-    -- can still promote exactly one Actor level.
+    -- Build-zone volumes are never visual targets, including furniture children.
+    IgnoreBuildZones = true,
+    -- Other standalone query/render helpers can be skipped independently.
     MaxTransparentHelperTraceSkips = 8,
     TransparentStandaloneHelperClassPatterns = {
         "BuildZone",
@@ -39,6 +39,18 @@ return {
     UniversalDebugTraceMaxResults = 4,
     UniversalDebugTraceChannelCount = 32,
     UniversalDebugObjectTypeCount = 32,
+
+    -- Do not create markers while a UMG text input owns keyboard/user focus.
+    -- This covers chat plus other editable fields without depending on one
+    -- game-specific chat widget name. The check runs only when a marker key is
+    -- pressed, not every frame.
+    IgnoreMarkerWhileTyping = true,
+    TextInputWidgetClasses = {
+        "EditableText",
+        "EditableTextBox",
+        "MultiLineEditableText",
+        "MultiLineEditableTextBox",
+    },
 
     -- Blueprint-visible PrimitiveComponent properties used when this UE4SS
     -- build cannot enumerate an Actor's component TArray.
@@ -72,20 +84,18 @@ return {
     -- network-safe marker type discriminator on every client.
     EntityAnchorScale = 0.01,
     EntityAnchorDetectionScale = 0.02,
-    -- If the server-side target Actor has no usable network reference on a
-    -- client, resolve that client's local instance around the replicated hit
-    -- anchor. This avoids depending on a server Actor ID for map-local props.
-    LocalResolveRadius = 180.0,
+    -- If the server-side target Actor has no usable network reference, each
+    -- client checks a short ray segment around the replicated hit anchor.
+    -- Exact line traces run first; one narrow swept ray covers the anchor's
+    -- surface offset. No broad SphereOverlapActors query is used.
+    LocalResolveRayBacktrack = 120.0,
+    LocalResolveRayForward = 80.0,
+    LocalResolveRaySweepRadius = 24.0,
+    LocalResolveTraceChannels = { 0, 2 },
+    LocalResolveObjectTypes = { 0, 1, 2, 3, 4, 5 },
     LocalResolveMaxBoundsDistance = 80.0,
-    LocalResolveObjectTypeCount = 32,
-    LocalResolveLogCandidateCount = 8,
     -- Hidden entity anchors encode a precise-component flag in replicated Pitch.
     ComponentMarkerPitch = 37.0,
-    -- Fallback classes used when GetComponentsByInterface is unavailable on a
-    -- client. The nearest owned instance to the replicated hit point is chosen.
-    PreciseInteractionComponentClasses = {
-        "VendingButton_BP_C",
-    },
 
     -- Push the sphere away from the surface so the outline is not buried in geometry.
     SurfaceOffset = 18.0,
@@ -100,28 +110,32 @@ return {
     -- Native E_OutlineMode value. Teammate Highlight uses 5 for its yellow outline.
     OutlineMode = 5,
 
-    -- Reassert an active entity outline at low frequency so the game's own
-    -- interaction highlight cannot permanently replace the marker colour.
-    EntityOutlineRefreshInterval = 0.25,
-    -- Only non-Mod values observed between refreshes are treated as the game's
-    -- latest desired state and considered during compare-and-restore cleanup.
-    TrackExternalOutlineState = true,
-    -- These actors require the game's native OutlineComponent to initialize
-    -- their render state before the direct true/250 maintenance write.
-    ForceNativeOutlineActorClassPatterns = {
-        "Resource_MicroNode",
-    },
-    -- One before/after snapshot per entity Mark. Periodic refreshes stay quiet.
+    -- Write Custom Depth to the target's real visible Meshes once. Whole-Actor
+    -- marks enumerate MeshComponents through the UE Blueprint reflection entry
+    -- and include child Actors so multi-part furniture can light as one object.
+    -- No Lua refresh or mid-lifetime state polling is performed.
+    EntityDirectStencilValue = 250,
+    EntityOutlineIncludeChildActors = true,
+    -- Cleanup reads each Mesh once. It restores the captured pre-Mark value only
+    -- if the Mesh still has this exact marker state; any changed state is left
+    -- untouched for the game or another Mod to own.
     OutlineDiagnostics = true,
+
+    -- One-shot structure logging for known partial-outline targets.
+    -- This does not change trace selection or outline collection. It records
+    -- Actor/component attachment data once per matching Actor for diagnosis.
+    OutlineStructureDiagnostics = false,
+    OutlineStructureDiagnosticActorPatterns = {
+        "Cart",
+        "ElectricFan",
+    },
+    OutlineStructureDiagnosticMaxActors = 24,
+    OutlineStructureDiagnosticMaxComponentsPerActor = 64,
 
     -- Custom Depth Stencil written directly to the marker sphere. Zero is ignored
     -- by the game's outline post-process, so keep this non-zero.
     -- Outline modes are stored as bits; mode 5 maps to bit 5 (32).
     DirectStencilValue = 32,
-
-    -- Experimental direct entity value observed on FurnitureMesh after the
-    -- game's interaction highlight initialized the snack vending machine.
-    EntityDirectStencilValue = 250,
 
     -- Screen-space TextBlock attached directly to the game's PrimaryHUDCanvas.
     -- Its size is fixed in UI pixels and independent of world distance.
@@ -150,6 +164,17 @@ return {
     LabelScreenOffsetY = 20.0,
     -- 20 Hz remains responsive while reducing HUD work with eight markers.
     LabelUpdateInterval = 0.05,
+    -- Refresh shape-derived label offsets at 4 Hz; position still follows at 20 Hz.
+    LabelBoundsUpdateInterval = 0.25,
+    -- Expiry/object cleanup runs twice a second; label projection stays at 20 Hz.
+    MaintenanceInterval = 0.5,
+    InputDiagnostics = true,
+    InputDiagnosticsInterval = 5,
+    -- Only active marker work reaches the 20 Hz updater. Slow active updates
+    -- are logged at most once per throttle window for real-game profiling.
+    PerformanceDiagnostics = true,
+    PerformanceSlowTickThresholdMs = 2.0,
+    PerformanceLogThrottleSeconds = 2.0,
     -- 2.5 is exactly twice the previous 1.25 screen-space scale.
     HudLabelScale = 2.5,
     HudLabelTypeface = "Bold",
@@ -175,7 +200,8 @@ return {
     -- 15 wrapped bits at 4 cm cover the nearest +/-655.36 m interval, which
     -- exceeds the configured 500 m trace distance while reducing packet size.
     MarkerPacketCoordinateBits = 15,
-    MarkerPacketSymbolDelayMs = 4,
+    -- Batches now run on the existing label Tick, with no delayed callbacks.
+    -- Protocol 2 wire symbols are unchanged. BatchSize remains a per-Tick cap.
     MarkerPacketBatchSize = 4,
     MarkerPacketReceiveTimeout = 2.0,
     MarkerPacketDecodedDistanceMargin = 5000.0,
@@ -189,7 +215,7 @@ return {
 
     -- Cooldown uses the game's warning beep; success uses a distinct Pager click.
     CooldownWarningSound = true,
-    CooldownWarningSoundThrottle = 0.25,
+    -- At most one warning per successful local request's cooldown cycle.
     CooldownWarningTextFormat = "Marker cooldown: %.1fs remaining",
     LocalMarkerSuccessSound = true,
     LocalMarkerSuccessSoundPath = "/Game/Audio/UI/Pager/ui_pager_click.ui_pager_click",
@@ -197,6 +223,10 @@ return {
     RejectDuplicateEntityMarks = true,
     DuplicateMarkerWarningText = "Target already marked",
 
-    -- Log successful requests and generated anchors to UE4SS.log.
-    DebugLogging = true,
+    -- Verbose per-marker diagnostics are opt-in in release builds. Slow marker
+    -- tick warnings above remain available while this is false.
+    DebugLogging = false,
+    -- Per accepted trace only: records exact/probe arbitration and authoritative
+    -- ray source for reproducing small-target selection. Does not add HUD text.
+    TraceSelectionDiagnostics = true,
 }
